@@ -1,0 +1,2103 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>経理メイト · 三島店</title>
+<style>
+  html,body{margin:0;padding:0;background:#faf8f3}
+  #root{min-height:100vh}
+  .km-boot{display:grid;place-items:center;height:100vh;font-family:sans-serif;color:#1f6e54}
+</style>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head>
+<body>
+<div id="root"><div class="km-boot">経理メイトを起動中…</div></div>
+<script>
+const KMStore = (function () {
+  const DB = "keiriMateDB", STORE = "state", KEY = "main";
+  const CFG_KEY = "keiriMateCloud"; // localStorage: { url, token }
+
+  function open() {
+    return new Promise((res, rej) => {
+      const req = indexedDB.open(DB, 1);
+      req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+      req.onsuccess = () => res(req.result);
+      req.onerror = () => rej(req.error);
+    });
+  }
+
+  // ---- ローカル(IndexedDB) ----
+  function loadLocal() {
+    return (async () => {
+      try {
+        const db = await open();
+        return await new Promise((res) => {
+          const tx = db.transaction(STORE, "readonly").objectStore(STORE).get(KEY);
+          tx.onsuccess = () => res(tx.result || null);
+          tx.onerror = () => res(null);
+        });
+      } catch (e) { return null; }
+    })();
+  }
+  function saveLocalNow(data) {
+    return (async () => {
+      try {
+        const db = await open();
+        db.transaction(STORE, "readwrite").objectStore(STORE).put(JSON.parse(JSON.stringify(data)), KEY);
+      } catch (e) { console.warn("local save failed", e); }
+    })();
+  }
+
+  // ---- クラウド設定 (localStorage) ----
+  function getConfig() {
+    try { return JSON.parse(localStorage.getItem(CFG_KEY) || "null"); } catch (e) { return null; }
+  }
+  function setConfig(cfg) {
+    if (cfg && cfg.url) localStorage.setItem(CFG_KEY, JSON.stringify({ url: cfg.url, token: cfg.token || "" }));
+    else localStorage.removeItem(CFG_KEY);
+  }
+  function isCloud() { const c = getConfig(); return !!(c && c.url); }
+
+  // ---- クラウド(GAS) 通信 ----
+  async function cloudLoad() {
+    const c = getConfig();
+    if (!c || !c.url) return { ok: false, error: "未設定" };
+    try {
+      const u = c.url + (c.url.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(c.token || "");
+      const r = await fetch(u, { method: "GET" });
+      const j = await r.json();
+      if (!j.ok) return { ok: false, error: j.error || "読込失敗" };
+      return { ok: true, data: j.data || null };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  }
+  async function cloudSave(data) {
+    const c = getConfig();
+    if (!c || !c.url) return { ok: false, error: "未設定" };
+    try {
+      // GASのCORS制約回避のため text/plain で送信（プリフライト回避）
+      const r = await fetch(c.url, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        redirect: "follow",
+        body: JSON.stringify({ token: c.token || "", data: JSON.parse(JSON.stringify(data)) }),
+      });
+      const text = await r.text();
+      let j;
+      try { j = JSON.parse(text); }
+      catch (pe) {
+        // GASがHTML(ログイン要求やエラーページ)を返した場合
+        return { ok: false, error: "サーバが想定外の応答（" + r.status + "）。デプロイの『アクセス:全員』を確認してください。" };
+      }
+      if (!j.ok) return { ok: false, error: j.error || "保存失敗" };
+      return { ok: true, savedAt: j.savedAt };
+    } catch (e) { return { ok: false, error: String(e) }; }
+  }
+
+  let saveTimer = null;
+  return {
+    // 起動時の読込: クラウド設定があればクラウド優先、無ければローカル
+    async load() {
+      if (isCloud()) {
+        const res = await cloudLoad();
+        if (res.ok) {
+          if (res.data) { saveLocalNow(res.data); return res.data; }
+          // クラウドが空＝初回。ローカルにデータがあればそれを採用（後で保存される）
+          return await loadLocal();
+        }
+        // クラウド接続失敗 → ローカルキャッシュにフォールバック（オフライン継続）
+        console.warn("cloud load failed:", res.error);
+      }
+      return await loadLocal();
+    },
+    // 通常保存: ローカル即時 + クラウドへデバウンス送信
+    save(data) {
+      saveLocalNow(data);
+      if (!isCloud()) return;
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(async () => {
+        const res = await cloudSave(data);
+        if (!res.ok) console.warn("cloud save failed:", res.error);
+        window.dispatchEvent(new CustomEvent("km-cloud-sync", { detail: res }));
+      }, 1200);
+    },
+    // 設定タブから使う公開API
+    getConfig, setConfig, isCloud,
+    cloudLoad, cloudSave, loadLocal,
+  };
+})();
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect } = React;
+
+
+/* =====================================================================
+   経理メイト — 速報フェーズ (日報入力 → 月末着地予測)
+   三島店 / FC簡易損益計算書 連動プロトタイプ
+
+   データ層は dataStore 経由に統一。今は localState 実装だが、
+   後で Google Apps Script (fetch) に差し替えるだけで Sheets 永続化に移行可能。
+   ===================================================================== */
+
+// ---- 店舗マスタ / 標準値 (FCテンプレ準拠・三島店は沼津シートを雛形に編集可) ----
+const STANDARD = {
+  // FCテンプレートの標準率 (税抜)
+  rate: {
+    genka: 0.405,     // 売上原価
+    niku: 0.3056,     // 肉仕入
+    kome: 0.0122,     // 米仕入
+    yasai: 0.0387,    // 野菜等
+    chomi: 0.0387,    // 調味料
+    inryo: 0.0102,    // 飲料水
+    royalty: 0.05,    // ロイヤリティ
+    suidou: 0.05,     // 水道光熱費
+    eigyo: 0.0641,    // 営業利益 標準率
+  },
+};
+
+// 仕入区分 (FCテンプレの原価項目)
+const GENKA_CATS = [
+  ["niku", "肉仕入"],
+  ["kome", "米仕入"],
+  ["yasai", "野菜等"],
+  ["chomi", "調味料"],
+  ["inryo", "飲料水"],
+];
+
+// 三島店 既定設定 (月初に確認・編集)
+const DEFAULT_SETTINGS = {
+  storeName: "三島店",
+  company: "株式会社ｈｉｌｌｓ",
+  businessDays: 30,       // 当月営業日数
+  prevSales: 0,           // 前月売上(税抜・円)
+  planSales: 0,           // 計画売上(円)
+  // 固定費 (月額・税抜・円)
+  rent: 0,                // 家賃
+  depreciation: 0,        // 減価償却費
+  loanRepay: 0,           // 借入元金返済
+  royaltyRate: 0.05,      // ロイヤリティ率
+  fixedLabor: 0,          // 社員給与(固定)
+  partRate: 7500,         // アルバイト1人当たり日額(概算・円)
+  // 想定原価率 (空なら標準率を使用)
+  assumedGenkaRate: "",
+  taxRate: 0.08,          // 軽減税率(税込売上→税抜換算用)
+};
+
+// 業者(取引先)マスタ 初期例。cat は GENKA_CATS のキー。
+const DEFAULT_VENDORS = [
+  { id: 1, name: "（例）○○精肉", cat: "niku" },
+  { id: 2, name: "（例）△△青果", cat: "yasai" },
+];
+
+// ---- データ抽象層 (Sheets差し替えポイント) ----
+const dataStore = {
+  load() {
+    // GAS版: return fetch(GAS_URL + "?action=load").then(r=>r.json())
+    return null; // localStorage非対応環境のためメモリ運用
+  },
+  save() {
+    // GAS版: fetch(GAS_URL, {method:"POST", body: JSON.stringify({action:"save", ...})})
+  },
+};
+
+const yen = (n) =>
+  isFinite(n) ? "¥" + Math.round(n).toLocaleString("ja-JP") : "—";
+const pct = (n) => (isFinite(n) ? (n * 100).toFixed(1) + "%" : "—");
+const todayStr = () => new Date().toISOString().slice(0, 10);
+
+// ---- エアメイトCSV列インデックス ----
+const AM = { store: 1, date: 2, dow: 3, sales: 5, target: 6, lastSales: 9, guests: 29, perGuest: 41 };
+
+// cp932(Shift-JIS) を含むCSVを安全に読む。fileは File オブジェクト。
+function readAirmateCSV(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("ファイルを読めませんでした"));
+    reader.onload = () => {
+      try {
+        const buf = new Uint8Array(reader.result);
+        // まずUTF-8で試し、文字化け(\uFFFD)が多ければShift_JISで再デコード
+        let text = new TextDecoder("utf-8").decode(buf);
+        if ((text.match(/\uFFFD/g) || []).length > 3) {
+          text = new TextDecoder("shift_jis").decode(buf);
+        }
+        resolve(parseCSVText(text));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+}
+
+// CSVテキスト → 行配列(ダブルクォート対応)
+function splitCSV(text) {
+  const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  return lines.map((line) => {
+    const out = []; let cur = ""; let q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (q) {
+        if (ch === '"' && line[i + 1] === '"') { cur += '"'; i++; }
+        else if (ch === '"') q = false;
+        else cur += ch;
+      } else {
+        if (ch === '"') q = true;
+        else if (ch === ",") { out.push(cur); cur = ""; }
+        else cur += ch;
+      }
+    }
+    out.push(cur);
+    return out;
+  });
+}
+
+const csvNum = (s) => Number(String(s == null ? "" : s).replace(/[, ¥\s]/g, "")) || 0;
+
+// 形式を自動判別して日次データに変換
+// 形式A: 日次サマリ(横長・1行目ヘッダに「日付」列、店舗ごと1日1行)
+// 形式B: 日別売上月報(上部メタ + 「月日」始まりヘッダ + 合計行)
+function parseCSVText(text) {
+  const rows = splitCSV(text).filter((r) => r.some((c) => c && c.length));
+  // ヘッダ行を探す
+  const headerA = rows.findIndex((r) => r.includes("日付"));
+  const headerB = rows.findIndex((r) => r[0] && r[0].trim() === "月日");
+  let data;
+  if (headerB !== -1) data = parseMonthlyReport(rows, headerB);
+  else if (headerA !== -1) data = parseDailySummary(rows, headerA);
+  else throw new Error("対応するヘッダ（「日付」または「月日」）が見つかりません");
+  // 未来日ガード: 今日より後の日付は実績が存在しないため除外
+  const today = todayStr();
+  return data.filter((d) => d.date && d.date <= today);
+}
+
+// 形式A: 日次サマリ
+function parseDailySummary(rows, hidx) {
+  const data = [];
+  for (let i = hidx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    if (!r[AM.date]) continue;
+    data.push({
+      date: normDate(r[AM.date].trim()),
+      dow: (r[AM.dow] || "").trim(),
+      store: (r[AM.store] || "").trim(),
+      sales: csvNum(r[AM.sales]),
+      target: csvNum(r[AM.target]),
+      lastSales: csvNum(r[AM.lastSales]),
+      guests: csvNum(r[AM.guests]),
+      perGuest: csvNum(r[AM.perGuest]),
+    });
+  }
+  return data;
+}
+
+// 形式B: 日別売上月報
+function parseMonthlyReport(rows, hidx) {
+  // 対象年月をメタ行から取得（「作成日」等の他の日付を誤って拾わないよう対象年月行に限定）
+  let year = "", month = "";
+  for (let i = 0; i < hidx; i++) {
+    const s = rows[i].join(" ");
+    if (s.indexOf("対象年月") === -1) continue;
+    const m = s.match(/(\d{4})年\s*(\d{1,2})月/);
+    if (m) { year = m[1]; month = m[2].padStart(2, "0"); break; }
+  }
+  if (!year) {
+    throw new Error("「対象年月」が読み取れませんでした。ファイル上部のメタ情報をご確認ください");
+  }
+  const head = rows[hidx];
+  const col = (name) => head.findIndex((h) => (h || "").trim() === name);
+  const cSales = col("売上金額"), cTarget = col("売上目標"), cLast = col("昨年売上"),
+    cGuests = col("客数"), cPer = col("客単価");
+  const data = [];
+  let curMonth = month;
+  for (let i = hidx + 1; i < rows.length; i++) {
+    const r = rows[i];
+    const c0 = (r[0] || "").trim();
+    if (!c0) continue;
+    if (c0.startsWith("合計") || c0.startsWith("累積") || c0.startsWith("目標達成")) break;
+    const md = c0.match(/(?:(\d{1,2})月)?\s*(\d{1,2})日(?:\(([^)]*)\))?/);
+    if (!md) continue;
+    const mo = (md[1] || curMonth).padStart(2, "0"); curMonth = mo;
+    const day = md[2].padStart(2, "0");
+    const sales = csvNum(r[cSales]);
+    if (sales === 0) continue; // 未来日・売上0はスキップ
+    data.push({
+      date: `${year}-${mo}-${day}`,
+      dow: md[3] || "",
+      store: "",
+      sales,
+      target: cTarget >= 0 ? csvNum(r[cTarget]) : 0,
+      lastSales: cLast >= 0 ? csvNum(r[cLast]) : 0,
+      guests: cGuests >= 0 ? csvNum(r[cGuests]) : 0,
+      perGuest: cPer >= 0 ? csvNum(r[cPer]) : 0,
+    });
+  }
+  return data;
+}
+
+// 日付正規化: "2026/6/1" や "2026年06月01日" → "2026-06-01"
+function normDate(s) {
+  const m = s.match(/(\d{4})[-/年.](\d{1,2})[-/月.](\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  return s;
+}
+
+const ymOf = (d) => (d || "").slice(0, 7);   // "2026-06"
+const yOf = (d) => (d || "").slice(0, 4);    // "2026"
+const WEEKDAY_JP = ["日", "月", "火", "水", "木", "金", "土"];
+
+// ---- 天気 (Open-Meteo 無料API・キー不要) ----
+// 三島市の緯度経度。16時(JST)の天気を取得。
+const MISHIMA = { lat: 35.1188, lon: 138.9189 };
+// WMO weather_code → 日本語
+const WMO = {
+  0: "快晴", 1: "晴れ", 2: "薄曇り", 3: "曇り",
+  45: "霧", 48: "霧氷",
+  51: "霧雨(弱)", 53: "霧雨", 55: "霧雨(強)",
+  56: "着氷性霧雨", 57: "着氷性霧雨(強)",
+  61: "雨(弱)", 63: "雨", 65: "雨(強)",
+  66: "みぞれ", 67: "みぞれ(強)",
+  71: "雪(弱)", 73: "雪", 75: "雪(強)", 77: "霧雪",
+  80: "にわか雨(弱)", 81: "にわか雨", 82: "にわか雨(激)",
+  85: "にわか雪(弱)", 86: "にわか雪(強)",
+  95: "雷雨", 96: "雷雨(雹)", 99: "雷雨(激しい雹)",
+};
+function wmoText(code) {
+  return WMO[code] != null ? WMO[code] : "不明";
+}
+// 指定日(YYYY-MM-DD)の16時の天気を取得。過去数日〜当日に対応。
+async function fetchWeather16(dateStr) {
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${MISHIMA.lat}&longitude=${MISHIMA.lon}` +
+    `&hourly=temperature_2m,weather_code&timezone=Asia%2FTokyo&past_days=7&forecast_days=2`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("天気サービスに接続できません");
+  const data = await res.json();
+  const times = data.hourly && data.hourly.time;
+  if (!times) throw new Error("天気データを取得できません");
+  const target = `${dateStr}T16:00`;
+  const idx = times.indexOf(target);
+  if (idx === -1) throw new Error("対象日時の天気が見つかりません（範囲外）");
+  const code = data.hourly.weather_code[idx];
+  const temp = data.hourly.temperature_2m[idx];
+  return `${wmoText(code)} ${Math.round(temp)}℃`;
+}
+
+// 日報の税抜売上 = 税込売上 − 内税消費税8% − 内税消費税10%
+// 旧データ(tax8/tax10 のみ, salesIncTax/salesExTaxManual)も後方互換で計算
+function exSalesOf(r) {
+  if (r.salesInc != null && r.salesInc !== "") {
+    return (Number(r.salesInc) || 0) - (Number(r.tax8) || 0) - (Number(r.tax10) || 0);
+  }
+  // 旧: 消費税額からの逆算方式
+  if (r.tax8 != null || r.tax10 != null) {
+    return (Number(r.tax8) || 0) / 0.08 + (Number(r.tax10) || 0) / 0.10;
+  }
+  // 最旧: 税込/税抜手入力
+  const inc = (Number(r.salesIncTax) || 0) / 1.08;
+  const man = Number(r.salesExTaxManual) || 0;
+  return inc + man;
+}
+
+function App() {
+  const [tab, setTab] = useState("dash");
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [vendors, setVendors] = useState(DEFAULT_VENDORS);
+  const [reports, setReports] = useState([]); // 日報リスト
+  const [history, setHistory] = useState([]); // エアメイト取込日次データ(当年+前年)
+  const [targets, setTargets] = useState({ daily: {}, monthly: {}, yearly: {} }); // 手入力目標
+
+  // ---- ブラウザ保存(IndexedDB) からの復元 / 自動保存 ----
+  const [loaded, setLoaded] = React.useState(false);
+  React.useEffect(() => {
+    (async () => {
+      const d = await KMStore.load();
+      if (d) {
+        if (d.settings) setSettings(d.settings);
+        if (d.vendors) setVendors(d.vendors);
+        if (d.reports) setReports(d.reports);
+        if (d.history) setHistory(d.history);
+        if (d.targets) setTargets(d.targets);
+      }
+      setLoaded(true);
+    })();
+  }, []);
+  React.useEffect(() => {
+    if (!loaded) return;
+    KMStore.save({ settings, vendors, reports, history, targets });
+  }, [loaded, settings, vendors, reports, history, targets]);
+
+  // 日報入力フォーム
+  const [form, setForm] = useState({
+    date: todayStr(),
+    salesInc: "",      // 税込売上(円)
+    tax8: "",          // 内税の消費税額8%(円)
+    tax10: "",         // 内税の消費税額10%(円)
+    guests: "",        // 客数
+    partCount: "",     // アルバイト人数(当日) → 概算人件費 = 人数 × 設定の日額
+    meatTickets: "",   // 替え肉券(枚数) ※P/Lには流し込まない
+    weather: "",       // 天気(16時・三島市) 自動取得 or 手入力
+    note: "",          // 備考・特記事項
+    buys: {},          // { vendorId: 金額 } 納品書ごと
+  });
+
+  // ---- 集計 ----
+  const vendorMap = useMemo(() => {
+    const m = {};
+    for (const v of vendors) m[v.id] = v;
+    return m;
+  }, [vendors]);
+
+  const calc = useMemo(() => {
+    // 当月 = 日報のうち最新日付の年月（無ければ今日）
+    const latest = reports.length
+      ? reports.reduce((mx, r) => (r.date > mx ? r.date : mx), reports[0].date)
+      : todayStr();
+    const curYM = ymOf(latest);
+    const monthReports = reports.filter((r) => ymOf(r.date) === curYM);
+    const days = monthReports.length;
+
+    let salesEx = 0, salesInc = 0, guests = 0, partCount = 0, cashGenka = 0, meatTickets = 0;
+    const genkaParts = { niku: 0, kome: 0, yasai: 0, chomi: 0, inryo: 0 };
+    for (const r of monthReports) {
+      salesEx += exSalesOf(r);
+      salesInc += Number(r.salesInc) || 0;
+      guests += Number(r.guests) || 0;
+      partCount += Number(r.partCount) || 0;
+      meatTickets += Number(r.meatTickets) || 0;
+      for (const [vid, amt] of Object.entries(r.buys || {})) {
+        const v = vendorMap[vid] || vendorMap[Number(vid)];
+        const val = Number(amt) || 0;
+        cashGenka += val;
+        if (v && genkaParts[v.cat] != null) genkaParts[v.cat] += val;
+      }
+    }
+
+    // 前年同月（取込CSV history を参照）。当月の経過日数ぶんだけ比較するため、
+    // 前年同月の「同じ日までの累計」を取る（例: 当月12日まで → 前年も1〜12日）。
+    const prevYM = `${Number(curYM.slice(0, 4)) - 1}${curYM.slice(4)}`;
+    const maxDay = monthReports.reduce((mx, r) => {
+      const d = Number((r.date || "").slice(8, 10));
+      return d > mx ? d : mx;
+    }, 0);
+    let pyGuests = 0, pySalesInc = 0, pyDays = 0;
+    for (const h of history) {
+      if (ymOf(h.date) !== prevYM) continue;
+      const d = Number((h.date || "").slice(8, 10));
+      if (maxDay > 0 && d > maxDay) continue; // 当月の経過日数までに揃える
+      pyGuests += Number(h.guests) || 0;
+      pySalesInc += Number(h.sales) || 0; // CSVの売上は税込
+      pyDays++;
+    }
+    const hasPY = pyDays > 0;
+
+    // 客単価(税込) = 税込売上 / 客数
+    const perInc = guests > 0 ? salesInc / guests : 0;
+    const pyPerInc = pyGuests > 0 ? pySalesInc / pyGuests : 0;
+
+    // 原価率 = 累計仕入(現金仕入) / 税抜売上
+    const genkaRateActual = salesEx > 0 ? cashGenka / salesEx : 0;
+    // 概算人件費率 = (社員給与日割り + バイト人件費) / 税抜売上
+    // バイト人件費 = 延べアルバイト人数 × 1人当たり日額(設定)
+    const bizDays = Number(settings.businessDays) || days || 1;
+    const partRate = Number(settings.partRate) || 0;
+    const partLabor = partCount * partRate;
+    const empLaborToDate = (Number(settings.fixedLabor) || 0) * (days / bizDays);
+    const laborToDate = empLaborToDate + partLabor;
+    const laborRate = salesEx > 0 ? laborToDate / salesEx : 0;
+
+    // ---- 売上目標 達成度（税込基準）----
+    // 当月目標 = 月別目標(手入力) があればそれ、無ければ当月の日別目標の合計
+    let monthTarget = 0;
+    const mt = targets.monthly && targets.monthly[curYM];
+    if (mt != null && mt !== "") {
+      monthTarget = Number(mt) || 0;
+    } else if (targets.daily) {
+      for (const [d, v] of Object.entries(targets.daily)) {
+        if (ymOf(d) === curYM && v !== "" && v != null) monthTarget += Number(v) || 0;
+      }
+    }
+    // 当月累計 達成度 = 税込売上 / 当月目標
+    const achieveMonth = monthTarget > 0 ? salesInc / monthTarget : null;
+    // 本日までの想定到達 = 当月目標 × (経過営業日 / 当月営業日数)
+    const paceTarget = monthTarget > 0 ? monthTarget * (days / bizDays) : 0;
+    const achievePace = paceTarget > 0 ? salesInc / paceTarget : null;
+    // 本日(最新日)の日別目標と達成度
+    const latestDate = monthReports.reduce((mx, r) => (r.date > mx ? r.date : mx), monthReports[0] ? monthReports[0].date : "");
+    const todayTargetRaw = targets.daily && targets.daily[latestDate];
+    const todayTarget = todayTargetRaw != null && todayTargetRaw !== "" ? Number(todayTargetRaw) : 0;
+    const todaySalesInc = latestDate
+      ? (Number((monthReports.find((r) => r.date === latestDate) || {}).salesInc) || 0)
+      : 0;
+    const achieveToday = todayTarget > 0 ? todaySalesInc / todayTarget : null;
+
+    return {
+      curYM, days, bizDays,
+      salesInc, salesEx, guests, meatTickets, cashGenka, partCount, partLabor,
+      perInc,
+      genkaParts,
+      genkaRateActual, laborRate, laborToDate,
+      // 目標達成度
+      monthTarget, achieveMonth, paceTarget, achievePace,
+      latestDate, todayTarget, todaySalesInc, achieveToday,
+      // 前年比較
+      hasPY,
+      salesIncYoY: hasPY && pySalesInc > 0 ? salesInc / pySalesInc : null,
+      salesIncDeltaPY: hasPY ? salesInc - pySalesInc : null,
+      pySalesInc: hasPY ? pySalesInc : null,
+      guestsDeltaPY: hasPY ? guests - pyGuests : null,
+      perIncDeltaPY: hasPY && pyPerInc > 0 ? perInc - pyPerInc : null,
+      pyGuests: hasPY ? pyGuests : null,
+      pyPerInc: hasPY ? pyPerInc : null,
+      progress: bizDays > 0 ? days / bizDays : 0,
+    };
+  }, [reports, settings, vendorMap, history, targets]);
+
+  const addReport = () => {
+    // 入力された項目があるか（空欄は既存値を保持してマージ）
+    const filled = ["salesInc", "tax8", "tax10", "guests", "partCount", "meatTickets", "weather", "note"]
+      .some((k) => form[k] !== "" && form[k] != null);
+    const hasBuys = Object.values(form.buys || {}).some((v) => v !== "" && v != null);
+    if (!filled && !hasBuys) return;
+
+    setReports((p) => {
+      const existing = p.find((r) => r.date === form.date) || {};
+      // 入力された項目だけ上書き。空欄は既存値を維持。
+      const merged = { ...existing, date: form.date };
+      for (const k of ["salesInc", "tax8", "tax10", "guests", "partCount", "meatTickets", "weather", "note"]) {
+        if (form[k] !== "" && form[k] != null) merged[k] = form[k];
+      }
+      // 納品書は業者ごとにマージ（入力された業者だけ更新）
+      const mergedBuys = { ...(existing.buys || {}) };
+      for (const [vid, val] of Object.entries(form.buys || {})) {
+        if (val !== "" && val != null) mergedBuys[vid] = val;
+      }
+      merged.buys = mergedBuys;
+      return [...p.filter((r) => r.date !== form.date), merged].sort((a, b) =>
+        a.date < b.date ? -1 : 1
+      );
+    });
+    setForm((f) => ({
+      ...f, salesInc: "", tax8: "", tax10: "", guests: "",
+      partCount: "", meatTickets: "", weather: "", note: "", buys: {},
+    }));
+    setTab("dash");
+  };
+
+  return (
+    <div className="km-root">
+      <style>{CSS}</style>
+      <header className="km-head">
+        <div className="km-brand">
+          <span className="km-mark">経</span>
+          <div>
+            <div className="km-title">経理メイト</div>
+            <div className="km-sub">速報フェーズ · {settings.storeName}</div>
+          </div>
+        </div>
+        <nav className="km-nav">
+          {[["dash", "速報"], ["entry", "日報入力"], ["yoy", "前年比較"], ["goals", "目標設定"], ["log", "日報一覧"], ["vendor", "業者"], ["set", "設定"]].map(
+            ([k, label]) => (
+              <button
+                key={k}
+                className={"km-navbtn" + (tab === k ? " on" : "")}
+                onClick={() => setTab(k)}
+              >
+                {label}
+              </button>
+            )
+          )}
+        </nav>
+      </header>
+
+      <main className="km-main">
+        {tab === "dash" && <Dash calc={calc} settings={settings} />}
+        {tab === "entry" && (
+          <Entry form={form} setForm={setForm} addReport={addReport} settings={settings} vendors={vendors} reports={reports} />
+        )}
+        {tab === "yoy" && (
+          <YoY history={history} setHistory={setHistory} targets={targets} setTargets={setTargets} reports={reports} setReports={setReports} />
+        )}
+        {tab === "goals" && <Goals targets={targets} setTargets={setTargets} history={history} reports={reports} />}
+        {tab === "log" && <Log reports={reports} setReports={setReports} settings={settings} vendorMap={vendorMap} />}
+        {tab === "vendor" && <Vendors vendors={vendors} setVendors={setVendors} />}
+        {tab === "set" && (
+          <Settings
+            settings={settings} setSettings={setSettings}
+            vendors={vendors} setVendors={setVendors}
+            reports={reports} setReports={setReports}
+            history={history} setHistory={setHistory}
+            targets={targets} setTargets={setTargets}
+          />
+        )}
+      </main>
+      <footer className="km-foot">
+        データはこのセッション内に保持されます。Google Sheets連携時は dataStore を GAS に差し替えます。
+      </footer>
+    </div>
+  );
+}
+
+// ============================== 速報ダッシュボード ==============================
+function Dash({ calc, settings }) {
+  const c = calc;
+  const std = STANDARD.rate;
+  if (c.days === 0)
+    return (
+      <Empty
+        title="まだ日報がありません"
+        body="「日報入力」から売上を記録すると、当月累計の速報がここに表示されます。"
+      />
+    );
+
+  const ymLabel = c.curYM ? c.curYM.replace("-", "年") + "月" : "";
+
+  return (
+    <div className="km-page">
+      <div className="km-row">
+        <div className="km-card hero">
+          <div className="km-label">{ymLabel} 当月累計 · 税込売上</div>
+          <div className="km-big pos">{yen(c.salesInc)}</div>
+          <div className="km-herometa">
+            税抜 {yen(c.salesEx)} ／ 客数 {c.guests.toLocaleString()}人
+            {c.salesIncYoY != null && (
+              <span className="km-vs">
+                前年比 {yoyTxt(c.salesIncYoY)}（{deltaYen(c.salesIncDeltaPY)}）
+              </span>
+            )}
+          </div>
+          <div className="km-progress">
+            <div className="km-progress-bar" style={{ width: pct(c.progress) }} />
+          </div>
+          <div className="km-progress-meta">
+            進捗 {c.days} / {c.bizDays} 営業日
+            {c.monthTarget > 0 && (
+              <span className="km-vs">
+                当月目標 {yen(c.monthTarget)} ／ 達成 {pct(c.achieveMonth)}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {c.monthTarget > 0 ? (
+        <div className="km-row km-stats">
+          <Stat
+            label="当月 目標達成度"
+            value={pct(c.achieveMonth)}
+            sub={`目標 ${yen(c.monthTarget)}`}
+            cls={c.achieveMonth >= 1 ? "pos" : "neg"}
+          />
+          <Stat
+            label="ペース比（本日まで）"
+            value={c.achievePace != null ? pct(c.achievePace) : "—"}
+            sub={`想定到達 ${yen(c.paceTarget)}`}
+            cls={c.achievePace >= 1 ? "pos" : "neg"}
+          />
+          <Stat
+            label="本日 達成度"
+            value={c.achieveToday != null ? pct(c.achieveToday) : "—"}
+            sub={c.todayTarget > 0 ? `${c.latestDate} 目標 ${yen(c.todayTarget)}` : "本日目標 未設定"}
+            cls={c.achieveToday != null ? (c.achieveToday >= 1 ? "pos" : "neg") : "dim"}
+          />
+          <Stat
+            label="目標まで残り"
+            value={yen(Math.max(c.monthTarget - c.salesInc, 0))}
+            sub={`当月目標 − 累計`}
+          />
+        </div>
+      ) : (
+        <div className="km-row">
+          <div className="km-card" style={{ flex: 1 }}>
+            <div className="km-note" style={{ margin: 0 }}>
+              当月（{ymLabel}）の売上目標が未設定です。「目標設定」タブで月別または日別の目標を入力すると、ここに達成度が表示されます。
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="km-row km-stats">
+        <Stat label="当月累計 税込売上" value={yen(c.salesInc)} />
+        <Stat
+          label="税込売上 前年比"
+          value={c.salesIncYoY != null ? yoyTxt(c.salesIncYoY) : "—"}
+          sub={c.hasPY ? `前年 ${yen(c.pySalesInc)}` : "前年CSV未取込"}
+          cls={c.salesIncYoY != null ? yoyCls(c.salesIncYoY) : "dim"}
+        />
+        <Stat
+          label="税込売上 前年差"
+          value={c.salesIncDeltaPY != null ? deltaYen(c.salesIncDeltaPY) : "—"}
+          sub={c.hasPY ? "当月経過分で比較" : "前年CSV未取込"}
+          cls={c.salesIncDeltaPY != null ? deltaCls(c.salesIncDeltaPY) : "dim"}
+        />
+        <Stat label="当月累計 税抜売上" value={yen(c.salesEx)} />
+      </div>
+
+      <div className="km-row km-stats">
+        <Stat label="当月累計 客数" value={c.guests.toLocaleString() + " 人"} />
+        <Stat
+          label="客数 対前年増減"
+          value={c.guestsDeltaPY != null ? deltaNum(c.guestsDeltaPY, "人") : "—"}
+          sub={c.hasPY ? `前年 ${c.pyGuests.toLocaleString()}人` : "前年CSV未取込"}
+          cls={c.guestsDeltaPY != null ? deltaCls(c.guestsDeltaPY) : "dim"}
+        />
+        <Stat label="累計 税込客単価" value={yen(c.perInc)} sub={`税込売上÷客数`} />
+        <Stat
+          label="税込客単価 対前年増減"
+          value={c.perIncDeltaPY != null ? deltaYen(c.perIncDeltaPY) : "—"}
+          sub={c.hasPY ? `前年 ${yen(c.pyPerInc)}` : "前年CSV未取込"}
+          cls={c.perIncDeltaPY != null ? deltaCls(c.perIncDeltaPY) : "dim"}
+        />
+      </div>
+
+      <div className="km-row km-stats">
+        <Stat
+          label="原価率"
+          value={pct(c.genkaRateActual)}
+          sub={`仕入 ${yen(c.cashGenka)} ÷ 税抜`}
+          cls={c.genkaRateActual > std.genka ? "neg" : "pos"}
+        />
+        <Stat
+          label="概算 人件費率"
+          value={pct(c.laborRate)}
+          sub={`延べ${c.partCount}人＋社員 ÷ 税抜`}
+        />
+      </div>
+
+      <div className="km-row km-stats">
+        <Stat label="替え肉券 当月累計" value={c.meatTickets.toLocaleString() + " 枚"} sub="P/L非反映" />
+      </div>
+
+      <div className="km-card">
+        <div className="km-cardhead">原価内訳（当月累計・現金仕入）</div>
+        <div className="km-bars">
+          {[
+            ["肉仕入", c.genkaParts.niku],
+            ["米仕入", c.genkaParts.kome],
+            ["野菜等", c.genkaParts.yasai],
+            ["調味料", c.genkaParts.chomi],
+            ["飲料水", c.genkaParts.inryo],
+          ].map(([n, v]) => {
+            const max = Math.max(...Object.values(c.genkaParts), 1);
+            return (
+              <div className="km-bar-row" key={n}>
+                <span className="km-bar-lbl">{n}</span>
+                <div className="km-bar-track">
+                  <div className="km-bar-fill" style={{ width: (v / max) * 100 + "%" }} />
+                </div>
+                <span className="km-bar-val mono">{yen(v)}</span>
+              </div>
+            );
+          })}
+        </div>
+        <div className="km-note">
+          対前年は前年比較タブで取り込んだCSV（前年同月）を参照し、当月の経過日数に揃えて比較します。前年データが無い場合は「—」です。
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, sub, cls }) {
+  return (
+    <div className="km-card stat">
+      <div className="km-label">{label}</div>
+      <div className={"km-statval " + (cls || "")}>{value}</div>
+      {sub && <div className="km-statsub">{sub}</div>}
+    </div>
+  );
+}
+
+// ============================== 日報入力 ==============================
+function Entry({ form, setForm, addReport, settings, vendors, reports }) {
+  const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
+  const setBuy = (vid) => (e) =>
+    setForm((f) => ({ ...f, buys: { ...f.buys, [vid]: e.target.value } }));
+  const [wxBusy, setWxBusy] = useState(false);
+  const [wxErr, setWxErr] = useState("");
+  const getWeather = async () => {
+    setWxBusy(true); setWxErr("");
+    try {
+      const w = await fetchWeather16(form.date);
+      setForm((f) => ({ ...f, weather: w }));
+    } catch (e) {
+      setWxErr(e.message + "（手入力してください）");
+    } finally {
+      setWxBusy(false);
+    }
+  };
+  const salesInc = Number(form.salesInc) || 0;
+  const t8 = Number(form.tax8) || 0;
+  const t10 = Number(form.tax10) || 0;
+  const totalEx = salesInc - t8 - t10;
+  const catName = Object.fromEntries(GENKA_CATS);
+
+  // 選択中の日付に既存データがあるか
+  const existing = (reports || []).find((r) => r.date === form.date) || null;
+  // プレースホルダ表示用: 既存値があれば薄く出す（未入力なら維持される）
+  const ph = (k, suffix = "") => {
+    if (existing && existing[k] != null && existing[k] !== "")
+      return `現在 ${Number(existing[k]).toLocaleString()}${suffix}`;
+    return "0";
+  };
+  const loadExisting = () => {
+    if (!existing) return;
+    setForm((f) => ({
+      ...f,
+      salesInc: existing.salesInc ?? "",
+      tax8: existing.tax8 ?? "",
+      tax10: existing.tax10 ?? "",
+      guests: existing.guests ?? "",
+      partCount: existing.partCount ?? "",
+      meatTickets: existing.meatTickets ?? "",
+      weather: existing.weather ?? "",
+      note: existing.note ?? "",
+      buys: { ...(existing.buys || {}) },
+    }));
+  };
+
+  // 当月(入力中の日付の年月)の替え肉券 累計。入力中の値も加味して表示。
+  const ym = ymOf(form.date);
+  const meatThisMonth = (reports || [])
+    .filter((r) => ymOf(r.date) === ym && r.date !== form.date)
+    .reduce((s, r) => s + (Number(r.meatTickets) || 0), 0);
+  const meatWithToday = meatThisMonth + (Number(form.meatTickets) || 0);
+
+  return (
+    <div className="km-page">
+      <div className="km-card">
+        <div className="km-cardhead">日報入力</div>
+        <Field label="日付">
+          <input type="date" value={form.date} onChange={set("date")} />
+        </Field>
+        {existing && (
+          <div className="km-existing">
+            この日付には既に記録があります。<b>入力した項目だけ更新</b>され、空欄の項目は今の値が残ります。
+            <button className="km-loadbtn" onClick={loadExisting}>既存の値を読み込んで編集</button>
+          </div>
+        )}
+
+        <div className="km-subhead">売上（税抜 = 税込 − 消費税8% − 消費税10%）</div>
+        <div className="km-form">
+          <Field label="税込売上（円）">
+            <input type="number" placeholder={ph("salesInc")} value={form.salesInc} onChange={set("salesInc")} />
+          </Field>
+          <Field label="内税 消費税額10%（円）">
+            <input type="number" placeholder={ph("tax10")} value={form.tax10} onChange={set("tax10")} />
+          </Field>
+          <Field label="内税 消費税額8%（円）">
+            <input type="number" placeholder={ph("tax8")} value={form.tax8} onChange={set("tax8")} />
+          </Field>
+          <Field label="客数（人）">
+            <input type="number" placeholder={ph("guests", "人")} value={form.guests} onChange={set("guests")} />
+          </Field>
+        </div>
+        {salesInc > 0 && (
+          <div className="km-total">本日 税抜売上 <b>{yen(totalEx)}</b>
+            <span className="km-total-sub">（税込 {yen(salesInc)} − 8% {yen(t8)} − 10% {yen(t10)}）</span>
+          </div>
+        )}
+
+        <div className="km-subhead">人件費</div>
+        <div className="km-form">
+          <Field label="アルバイト人数（人）" hint={`1人 ${yen(Number(settings.partRate) || 0)}/日で概算（設定で変更可）`}>
+            <input type="number" placeholder={ph("partCount", "人")} value={form.partCount} onChange={set("partCount")} />
+          </Field>
+        </div>
+
+        <div className="km-subhead">替え肉券</div>
+        <div className="km-form">
+          <Field label="替え肉券（枚）" hint={`当月累計 ${meatWithToday.toLocaleString()} 枚（P/L非反映）`}>
+            <input type="number" placeholder={ph("meatTickets", "枚")} value={form.meatTickets} onChange={set("meatTickets")} />
+          </Field>
+        </div>
+
+        <div className="km-subhead">納品書入力（業者ごと）</div>
+        {vendors.length === 0 ? (
+          <div className="km-note">「業者」タブで取引先を登録すると、ここに入力欄が出ます。</div>
+        ) : (
+          <div className="km-form">
+            {vendors.map((v) => {
+              const cur = existing && existing.buys ? existing.buys[v.id] : null;
+              const phBuy = cur != null && cur !== "" ? `現在 ${Number(cur).toLocaleString()}` : "0";
+              return (
+                <Field key={v.id} label={v.name} hint={`→ ${catName[v.cat] || "未分類"}`}>
+                  <input type="number" placeholder={phBuy} value={form.buys[v.id] || ""} onChange={setBuy(v.id)} />
+                </Field>
+              );
+            })}
+          </div>
+        )}
+
+        <div className="km-subhead">天気・備考</div>
+        <div className="km-form">
+          <Field label="天気（16時・三島市）" hint="ボタンで自動取得、手入力も可">
+            <div className="km-wx-row">
+              <input type="text" placeholder={existing && existing.weather ? `現在 ${existing.weather}` : "例: 晴れ 24℃"}
+                value={form.weather} onChange={set("weather")} />
+              <button type="button" className="km-wx-btn" onClick={getWeather} disabled={wxBusy}>
+                {wxBusy ? "取得中…" : "自動取得"}
+              </button>
+            </div>
+          </Field>
+        </div>
+        {wxErr && <div className="km-wx-err">{wxErr}</div>}
+        <div className="km-form">
+          <Field label="備考・特記事項">
+            <textarea className="km-textarea" rows={3}
+              placeholder={existing && existing.note ? `現在: ${existing.note}` : "イベント、クレーム、設備不具合、近隣状況など"}
+              value={form.note} onChange={set("note")} />
+          </Field>
+        </div>
+
+        <button className="km-primary" onClick={addReport}>
+          {existing ? "この日報を更新（入力項目のみ）" : "この日報を記録"}
+        </button>
+        <div className="km-note">入力した項目だけ保存され、空欄の項目は既存の値が残ります。営業中に仕入だけ、閉店後に売上だけ、と分けて入力できます。</div>
+      </div>
+    </div>
+  );
+}
+
+function Field({ label, hint, children }) {
+  return (
+    <label className="km-field">
+      <span className="km-field-lbl">{label}</span>
+      {children}
+      {hint && <span className="km-field-hint">{hint}</span>}
+    </label>
+  );
+}
+
+// ============================== 業者マスタ ==============================
+function Vendors({ vendors, setVendors }) {
+  const [name, setName] = useState("");
+  const [cat, setCat] = useState("niku");
+  const add = () => {
+    if (!name.trim()) return;
+    const id = (vendors.reduce((m, v) => Math.max(m, v.id), 0) || 0) + 1;
+    setVendors((p) => [...p, { id, name: name.trim(), cat }]);
+    setName("");
+  };
+  const setVCat = (id) => (e) =>
+    setVendors((p) => p.map((v) => (v.id === id ? { ...v, cat: e.target.value } : v)));
+  const del = (id) => setVendors((p) => p.filter((v) => v.id !== id));
+  return (
+    <div className="km-page">
+      <div className="km-card">
+        <div className="km-cardhead">業者（取引先）マスタ</div>
+        <div className="km-note" style={{ marginTop: 0, marginBottom: 14 }}>
+          納品書を発行する業者を登録し、それぞれを仕入区分（肉/米/野菜/調味料/飲料）に紐付けます。
+          日報では業者ごとに金額を入れるだけで、自動で区分集計されます。
+        </div>
+        <div className="km-vrow km-vadd">
+          <input className="km-vname" placeholder="業者名（例: ○○精肉店）" value={name}
+            onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} />
+          <select value={cat} onChange={(e) => setCat(e.target.value)}>
+            {GENKA_CATS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+          </select>
+          <button className="km-add" onClick={add}>追加</button>
+        </div>
+        <div className="km-vlist">
+          {vendors.map((v) => (
+            <div className="km-vrow" key={v.id}>
+              <span className="km-vname-static">{v.name}</span>
+              <select value={v.cat} onChange={setVCat(v.id)}>
+                {GENKA_CATS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
+              </select>
+              <button className="km-del" onClick={() => del(v.id)}>削除</button>
+            </div>
+          ))}
+          {vendors.length === 0 && <div className="km-note">業者が未登録です。</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================== 日報一覧 ==============================
+function Log({ reports, setReports, settings, vendorMap }) {
+  const [month, setMonth] = useState("all");
+  if (reports.length === 0)
+    return <Empty title="日報がありません" body="「日報入力」から記録を追加してください。" />;
+  const del = (date) => setReports((p) => p.filter((r) => r.date !== date));
+
+  // 月リスト（新しい順）
+  const months = Array.from(new Set(reports.map((r) => ymOf(r.date)))).sort().reverse();
+  const shown = month === "all" ? reports : reports.filter((r) => ymOf(r.date) === month);
+  // 表示は新しい順
+  const sorted = [...shown].sort((a, b) => (a.date < b.date ? 1 : -1));
+  const monthLabel = (ym) => ym.replace("-", "年") + "月";
+
+  // 絞り込み月の合計
+  const tot = sorted.reduce((s, r) => {
+    s.inc += Number(r.salesInc) || 0;
+    s.ex += exSalesOf(r);
+    s.g += Number(r.guests) || 0;
+    s.buy += Object.values(r.buys || {}).reduce((a, x) => a + (Number(x) || 0), 0);
+    s.meat += Number(r.meatTickets) || 0;
+    return s;
+  }, { inc: 0, ex: 0, g: 0, buy: 0, meat: 0 });
+
+  return (
+    <div className="km-page">
+      <div className="km-card">
+        <div className="km-cardhead-row">
+          <div className="km-cardhead">日報一覧（{sorted.length}件）</div>
+          <select className="km-monthsel" value={month} onChange={(e) => setMonth(e.target.value)}>
+            <option value="all">全期間</option>
+            {months.map((m) => <option key={m} value={m}>{monthLabel(m)}</option>)}
+          </select>
+        </div>
+        <div className="km-tablewrap">
+          <table className="km-table">
+            <thead>
+              <tr><th>日付</th><th className="r">税込売上</th><th className="r">税抜売上</th><th className="r">客数</th><th className="r">客単価</th><th className="r">仕入額</th><th className="r">替え肉券</th><th>天気</th><th>備考</th><th></th></tr>
+            </thead>
+            <tbody>
+              {sorted.map((r) => {
+                const inc = (Number(r.salesInc) || 0);
+                const ex = exSalesOf(r);
+                const g = Number(r.guests) || 0;
+                const per = g > 0 ? ex / g : 0;
+                const buy = Object.values(r.buys || {}).reduce((s, x) => s + (Number(x) || 0), 0);
+                return (
+                  <tr key={r.date}>
+                    <td className="mono">{r.date}</td>
+                    <td className="r mono">{inc > 0 ? yen(inc) : "—"}</td>
+                    <td className="r mono">{yen(ex)}</td>
+                    <td className="r mono">{g.toLocaleString()}</td>
+                    <td className="r mono">{yen(per)}</td>
+                    <td className="r mono">{yen(buy)}</td>
+                    <td className="r mono">{(Number(r.meatTickets) || 0).toLocaleString()}</td>
+                    <td className="km-wx-cell">{r.weather || ""}</td>
+                    <td className="km-note-cell">{r.note || ""}</td>
+                    <td className="r"><button className="km-del" onClick={() => del(r.date)}>削除</button></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            <tfoot>
+              <tr className="em">
+                <td>{month === "all" ? "全期間 計" : monthLabel(month) + " 計"}</td>
+                <td className="r mono">{yen(tot.inc)}</td>
+                <td className="r mono">{yen(tot.ex)}</td>
+                <td className="r mono">{tot.g.toLocaleString()}</td>
+                <td className="r mono">{yen(tot.g > 0 ? tot.ex / tot.g : 0)}</td>
+                <td className="r mono">{yen(tot.buy)}</td>
+                <td className="r mono">{tot.meat.toLocaleString()}</td>
+                <td></td>
+                <td></td>
+                <td></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================== 目標設定 ==============================
+function Goals({ targets, setTargets, history, reports }) {
+  const [mode, setMode] = useState("monthly"); // daily / monthly / yearly
+  const [calMonth, setCalMonth] = useState(ymOf(todayStr())); // カレンダー対象月
+  const [newMonth, setNewMonth] = useState(ymOf(todayStr()));
+  const [newYear, setNewYear] = useState(yOf(todayStr()));
+  const [avgMsg, setAvgMsg] = useState("");
+
+  const removeKey = (scope, key) => {
+    setTargets((t) => {
+      const next = { ...t[scope] };
+      delete next[key];
+      return { ...t, [scope]: next };
+    });
+  };
+  const addKey = (scope, key) => {
+    if (!key) return;
+    setTargets((t) => (t[scope][key] != null ? t : { ...t, [scope]: { ...t[scope], [key]: "" } }));
+  };
+
+  const monthLabel = (ym) => `${Number(ym.slice(0, 4))}年${Number(ym.slice(5, 7))}月`;
+  const daysInMonthOf = (ym) => new Date(Number(ym.slice(0, 4)), Number(ym.slice(5, 7)), 0).getDate();
+  const dailySumOf = (ym, daily) => {
+    let s = 0;
+    const n = daysInMonthOf(ym);
+    for (let d = 1; d <= n; d++) {
+      const v = daily[`${ym}-${String(d).padStart(2, "0")}`];
+      if (v != null && v !== "") s += Number(v) || 0;
+    }
+    return s;
+  };
+
+  const setVal = (scope, key) => (e) => {
+    const v = e.target.value;
+    setTargets((t) => {
+      if (scope === "daily") {
+        // 日別を編集 → その月の日別合計を月別目標に自動反映
+        const nextDaily = { ...t.daily, [key]: v };
+        const ym = ymOf(key);
+        const sum = dailySumOf(ym, nextDaily);
+        return { ...t, daily: nextDaily, monthly: { ...t.monthly, [ym]: sum > 0 ? String(sum) : "" } };
+      }
+      return { ...t, [scope]: { ...t[scope], [key]: v } };
+    });
+  };
+
+  // 月別目標を入力 → (入力値 − 現在の日別合計) の差分を全日へ均等加算。端数は最終日で調整。
+  const setMonthlyTarget = (ym) => (e) => {
+    const raw = e.target.value;
+    setTargets((t) => {
+      if (raw === "") {
+        return { ...t, monthly: { ...t.monthly, [ym]: "" } };
+      }
+      const targetTotal = Number(raw) || 0;
+      const n = daysInMonthOf(ym);
+      const curSum = dailySumOf(ym, t.daily);
+      const diff = targetTotal - curSum;
+      const per = Math.floor(diff / n);
+      const remainder = diff - per * n; // 端数(最終日で吸収)
+      const nextDaily = { ...t.daily };
+      for (let d = 1; d <= n; d++) {
+        const dateStr = `${ym}-${String(d).padStart(2, "0")}`;
+        const base = Number(nextDaily[dateStr]) || 0;
+        let add = per;
+        if (d === n) add += remainder; // 端数を最終日に
+        const val = base + add;
+        nextDaily[dateStr] = String(val);
+      }
+      // 念のため合計を厳密一致させる
+      return { ...t, daily: nextDaily, monthly: { ...t.monthly, [ym]: String(targetTotal) } };
+    });
+  };
+
+  // 当月日報を history に重ねた前年参照用データ
+  const mergedHistory = useMemo(() => {
+    const map = {};
+    for (const r of (history || [])) map[r.date] = { ...r };
+    const repDates = (reports || []).map((r) => r.date).filter(Boolean);
+    const curYM = repDates.length ? ymOf(repDates.sort().reverse()[0]) : null;
+    for (const r of (reports || [])) {
+      if (!r.date) continue;
+      if (curYM && ymOf(r.date) !== curYM) continue;
+      const inc = Number(r.salesInc) || 0;
+      const g = Number(r.guests) || 0;
+      if (inc === 0 && g === 0) continue;
+      const dow = WEEKDAY_JP[new Date(r.date + "T00:00:00").getDay()];
+      map[r.date] = { ...(map[r.date] || {}), date: r.date, sales: inc, guests: g, dow: (map[r.date] && map[r.date].dow) || dow };
+    }
+    return Object.values(map);
+  }, [history, reports]);
+
+  // 前年同月・同曜日の平均売上を、対象月の各日に仮入力
+  const fillWeekdayAvg = () => {
+    // 前年データを 月+曜日 でグルーピング
+    const pyByMonthDow = {};
+    for (const h of mergedHistory) {
+      const sales = Number(h.sales) || 0;
+      if (sales === 0) continue;
+      const dow = h.dow || WEEKDAY_JP[new Date(h.date + "T00:00:00").getDay()];
+      const key = ymOf(h.date) + "|" + dow;
+      (pyByMonthDow[key] = pyByMonthDow[key] || []).push(sales);
+    }
+    const y = Number(calMonth.slice(0, 4));
+    const m = Number(calMonth.slice(5, 7));
+    const daysInMonth = new Date(y, m, 0).getDate();
+    const prevYM = `${y - 1}-${calMonth.slice(5, 7)}`;
+    const next = { ...targets.daily };
+    let filled = 0;
+    for (let d = 1; d <= daysInMonth; d++) {
+      const dateStr = `${calMonth}-${String(d).padStart(2, "0")}`;
+      const dow = WEEKDAY_JP[new Date(dateStr + "T00:00:00").getDay()];
+      const arr = pyByMonthDow[prevYM + "|" + dow];
+      if (arr && arr.length) {
+        next[dateStr] = String(Math.round(arr.reduce((s, x) => s + x, 0) / arr.length));
+        filled++;
+      }
+    }
+    setTargets((t) => {
+      const sum = dailySumOf(calMonth, next);
+      return { ...t, daily: next, monthly: { ...t.monthly, [calMonth]: sum > 0 ? String(sum) : (t.monthly[calMonth] ?? "") } };
+    });
+    setAvgMsg(filled > 0
+      ? `${monthLabel(calMonth)} の ${filled}日分に、前年同月・同曜日の平均を仮入力しました（各マスで上書き可）。月別目標にも合計を反映しました。`
+      : `前年同月（${prevYM}）のデータが見つかりませんでした。CSVを取り込むか日報を入力してください。`);
+  };
+
+  const monthlyKeys = Object.keys(targets.monthly || {}).sort().reverse();
+  const yearlyKeys = Object.keys(targets.yearly || {}).sort().reverse();
+
+  // カレンダー用: 対象月の日付配列（先頭の曜日オフセット込み）
+  const calY = Number(calMonth.slice(0, 4));
+  const calM = Number(calMonth.slice(5, 7));
+  const firstDow = new Date(calY, calM - 1, 1).getDay();
+  const daysInCal = new Date(calY, calM, 0).getDate();
+  const calCells = [];
+  for (let i = 0; i < firstDow; i++) calCells.push(null);
+  for (let d = 1; d <= daysInCal; d++) calCells.push(d);
+  const shiftMonth = (delta) => {
+    const dt = new Date(calY, calM - 1 + delta, 1);
+    setCalMonth(`${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}`);
+    setAvgMsg("");
+  };
+  const calMonthTotal = (() => {
+    let s = 0;
+    for (let d = 1; d <= daysInCal; d++) {
+      const v = targets.daily[`${calMonth}-${String(d).padStart(2, "0")}`];
+      if (v) s += Number(v) || 0;
+    }
+    return s;
+  })();
+
+  return (
+    <div className="km-page">
+      <div className="km-card">
+        <div className="km-cardhead-row">
+          <div className="km-cardhead">売上目標の設定（税込）</div>
+          <div className="km-seg">
+            {[["daily", "日別"], ["monthly", "月別"], ["yearly", "年間"]].map(([k, l]) => (
+              <button key={k} className={"km-segbtn" + (mode === k ? " on" : "")} onClick={() => setMode(k)}>{l}</button>
+            ))}
+          </div>
+        </div>
+        <div className="km-note" style={{ marginTop: 0, marginBottom: 14 }}>
+          未来の日付・月・年の目標も入力できます。日別目標を入れた月は、その月の目標額として自動合算され、速報の達成度に反映されます（月別を直接入れた場合はそちらが優先）。
+        </div>
+
+        {mode === "daily" && (
+          <div>
+            <div className="km-cal-nav">
+              <button className="km-cal-arrow" onClick={() => shiftMonth(-1)}>‹</button>
+              <div className="km-cal-month">{monthLabel(calMonth)}</div>
+              <button className="km-cal-arrow" onClick={() => shiftMonth(1)}>›</button>
+              <span className="km-cal-total">月合計 {yen(calMonthTotal)}</span>
+            </div>
+            <div className="km-tgt-tools">
+              <button className="km-avgbtn" onClick={fillWeekdayAvg}>
+                この月に「前年同月・同曜日の平均」を仮入力
+              </button>
+              <span className="km-tgt-note">各マスで個別に上書きできます</span>
+            </div>
+            {avgMsg && <div className="km-msg">{avgMsg}</div>}
+            <div className="km-cal">
+              {["日", "月", "火", "水", "木", "金", "土"].map((w, i) => (
+                <div key={w} className={"km-cal-wd" + (i === 0 ? " sun" : i === 6 ? " sat" : "")}>{w}</div>
+              ))}
+              {calCells.map((d, i) => {
+                if (d == null) return <div key={"e" + i} className="km-cal-cell empty" />;
+                const dateStr = `${calMonth}-${String(d).padStart(2, "0")}`;
+                const dow = new Date(dateStr + "T00:00:00").getDay();
+                return (
+                  <div key={dateStr} className={"km-cal-cell" + (dow === 0 ? " sun" : dow === 6 ? " sat" : "")}>
+                    <div className="km-cal-day">{d}</div>
+                    <input className="km-cal-input" type="number" placeholder="0"
+                      value={targets.daily[dateStr] ?? ""} onChange={setVal("daily", dateStr)} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {mode === "monthly" && (
+          <div>
+            <div className="km-addrow">
+              <input type="month" value={newMonth} onChange={(e) => setNewMonth(e.target.value)} />
+              <button className="km-add" onClick={() => addKey("monthly", newMonth)}>この月を追加</button>
+            </div>
+            {monthlyKeys.length === 0 ? (
+              <div className="km-note">月別目標は未設定です。月を追加して金額を入力してください。</div>
+            ) : (
+              <table className="km-table">
+                <thead><tr><th>月</th><th className="r">目標（税込・円）</th><th className="r">日別合計</th><th></th></tr></thead>
+                <tbody>
+                  {monthlyKeys.map((m) => {
+                    const dsum = dailySumOf(m, targets.daily);
+                    return (
+                      <tr key={m}>
+                        <td className="mono nowrap">{monthLabel(m)}</td>
+                        <td className="r"><input className="km-tgt" type="number" placeholder="0" value={targets.monthly[m] ?? ""} onChange={setMonthlyTarget(m)} /></td>
+                        <td className="r mono dim">{yen(dsum)}</td>
+                        <td className="r"><button className="km-del" onClick={() => removeKey("monthly", m)}>削除</button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+            <div className="km-note">
+              月別目標を入力すると、現在の日別合計との差分をその月の全日に均等加算します（端数は月末日で調整）。
+              逆に日別カレンダーを編集すると、その月の月別目標は日別合計に自動更新されます。
+            </div>
+          </div>
+        )}
+
+        {mode === "yearly" && (
+          <div>
+            <div className="km-addrow">
+              <input type="number" placeholder="2026" value={newYear} onChange={(e) => setNewYear(e.target.value)} style={{ width: 120 }} />
+              <button className="km-add" onClick={() => addKey("yearly", String(newYear))}>この年を追加</button>
+            </div>
+            {yearlyKeys.length === 0 ? (
+              <div className="km-note">年間目標は未設定です。年を追加して金額を入力してください。</div>
+            ) : (
+              <table className="km-table">
+                <thead><tr><th>年</th><th className="r">目標（税込・円）</th><th></th></tr></thead>
+                <tbody>
+                  {yearlyKeys.map((y) => (
+                    <tr key={y}>
+                      <td className="mono nowrap">{y}年</td>
+                      <td className="r"><input className="km-tgt" type="number" placeholder="0" value={targets.yearly[y] ?? ""} onChange={setVal("yearly", y)} /></td>
+                      <td className="r"><button className="km-del" onClick={() => removeKey("yearly", y)}>削除</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ============================== 設定 ==============================
+function Settings({ settings, setSettings, vendors, setVendors, reports, setReports, history, setHistory, targets, setTargets }) {
+  const set = (k) => (e) =>
+    setSettings((s) => ({ ...s, [k]: e.target.value }));
+
+  // ---- バックアップ（エクスポート / インポート）----
+  const [bkMsg, setBkMsg] = useState("");
+  const SCHEMA = "keiri-mate-backup";
+  const VERSION = 1;
+
+  // ---- クラウド連携（Google Sheets / GAS）----
+  const _cfg = KMStore.getConfig() || { url: "", token: "" };
+  const [cloudUrl, setCloudUrl] = useState(_cfg.url || "");
+  const [cloudToken, setCloudToken] = useState(_cfg.token || "");
+  const [cloudMsg, setCloudMsg] = useState("");
+  const [cloudBusy, setCloudBusy] = useState(false);
+  const [syncMsg, setSyncMsg] = useState("");
+
+  useEffect(() => {
+    const h = (e) => {
+      const r = e.detail || {};
+      setSyncMsg(r.ok ? ("✓ クラウド保存済み " + new Date().toLocaleTimeString("ja-JP")) : ("✗ クラウド保存失敗: " + (r.error || "")));
+    };
+    window.addEventListener("km-cloud-sync", h);
+    return () => window.removeEventListener("km-cloud-sync", h);
+  }, []);
+
+  function saveCloudConfig() {
+    const url = (cloudUrl || "").trim();
+    const token = (cloudToken || "").trim();
+    if (!url) { KMStore.setConfig(null); setCloudMsg("クラウド連携を無効化しました（ローカル保存のみ）。"); return; }
+    if (url.indexOf("https://script.google.com/") !== 0) {
+      setCloudMsg("✗ URLが正しくないようです。GASウェブアプリのURL（https://script.google.com/macros/s/.../exec）を貼ってください。");
+      return;
+    }
+    KMStore.setConfig({ url, token });
+    setCloudMsg("✓ 設定を保存しました。「接続テスト」で確認してください。");
+  }
+
+  async function testCloud() {
+    setCloudBusy(true); setCloudMsg("接続中…");
+    KMStore.setConfig({ url: (cloudUrl || "").trim(), token: (cloudToken || "").trim() });
+    const res = await KMStore.cloudLoad();
+    setCloudBusy(false);
+    if (res.ok) {
+      const d = res.data;
+      const n = d && d.reports ? d.reports.length : 0;
+      const h = d && d.history ? d.history.length : 0;
+      setCloudMsg(`✓ 接続成功。クラウド上のデータ: 日報 ${n}件 / 過去データ ${h}件。${(!d ? "（まだ空です。次回保存時にアップロードされます）" : "")}`);
+    } else {
+      setCloudMsg("✗ 接続失敗: " + (res.error || "") + "（URL・トークン・デプロイ設定を確認してください）");
+    }
+  }
+
+  async function pushToCloud() {
+    setCloudBusy(true); setCloudMsg("アップロード中…");
+    const res = await KMStore.cloudSave({ settings, vendors, reports, history, targets });
+    setCloudBusy(false);
+    setCloudMsg(res.ok ? "✓ 現在のデータをクラウドへ保存しました。" : "✗ 保存失敗: " + (res.error || ""));
+  }
+
+  async function pullFromCloud() {
+    setCloudBusy(true); setCloudMsg("ダウンロード中…");
+    const res = await KMStore.cloudLoad();
+    setCloudBusy(false);
+    if (!res.ok) { setCloudMsg("✗ 取得失敗: " + (res.error || "")); return; }
+    if (!res.data) { setCloudMsg("クラウドにデータがありません。"); return; }
+    const d = res.data;
+    const n = d.reports ? d.reports.length : 0, h = d.history ? d.history.length : 0;
+    if (!window.confirm("クラウドのデータ（日報 " + n + "件 / 過去データ " + h + "件）で、このPCの表示を置き換えます。よろしいですか？")) {
+      setCloudMsg("取得を中止しました。"); return;
+    }
+    if (d.settings) setSettings(d.settings);
+    if (d.vendors) setVendors(d.vendors);
+    if (d.reports) setReports(d.reports);
+    if (d.history) setHistory(d.history);
+    if (d.targets) setTargets(d.targets);
+    setCloudMsg(`✓ クラウドから取得しました（日報 ${n}件 / 過去データ ${h}件）。`);
+  }
+
+  function doExport() {
+    try {
+      const payload = {
+        schema: SCHEMA,
+        version: VERSION,
+        exportedAt: new Date().toISOString(),
+        store: settings.storeName || "三島店",
+        data: { settings, vendors, reports, history, targets },
+      };
+      const json = JSON.stringify(payload, null, 2);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      a.href = url;
+      a.download = `経理メイト_${(settings.storeName || "三島店")}_${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      const n = (reports || []).length, h = (history || []).length;
+      setBkMsg(`✓ エクスポート完了（日報 ${n}件 / 過去データ ${h}件）。このファイルを別PCに移して取込んでください。`);
+    } catch (e) {
+      setBkMsg("✗ エクスポートに失敗しました: " + (e.message || e));
+    }
+  }
+
+  function onImportFile(e) {
+    const file = (e.target.files || [])[0];
+    e.target.value = "";
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let payload;
+      try {
+        payload = JSON.parse(reader.result);
+      } catch (err) {
+        setBkMsg("✗ 読み込み失敗: JSONとして解析できませんでした。");
+        return;
+      }
+      const d = payload && payload.data ? payload.data : payload;
+      if (!d || typeof d !== "object" || (!d.settings && !d.reports && !d.history)) {
+        setBkMsg("✗ 読み込み失敗: 経理メイトのバックアップファイルではないようです。");
+        return;
+      }
+      const nNew = (d.reports || []).length, hNew = (d.history || []).length;
+      const nOld = (reports || []).length, hOld = (history || []).length;
+      const ok = window.confirm(
+        "バックアップを取り込みます。\n\n" +
+        "現在のデータ（日報 " + nOld + "件 / 過去データ " + hOld + "件）は、\n" +
+        "取込むデータ（日報 " + nNew + "件 / 過去データ " + hNew + "件）で完全に置き換えられます。\n\n" +
+        "よろしいですか？"
+      );
+      if (!ok) { setBkMsg("取込みを中止しました。"); return; }
+      try {
+        if (d.settings) setSettings(d.settings);
+        if (d.vendors) setVendors(d.vendors);
+        if (d.reports) setReports(d.reports);
+        if (d.history) setHistory(d.history);
+        if (d.targets) setTargets(d.targets);
+        setBkMsg(`✓ 取込完了（日報 ${nNew}件 / 過去データ ${hNew}件）。自動的にこのPCへ保存されます。`);
+      } catch (err) {
+        setBkMsg("✗ 取込中にエラー: " + (err.message || err));
+      }
+    };
+    reader.onerror = () => setBkMsg("✗ ファイルの読み込みに失敗しました。");
+    reader.readAsText(file, "utf-8");
+  }
+
+  return (
+    <div className="km-page">
+      <div className="km-card">
+        <div className="km-cardhead">クラウド連携（Google Sheets）</div>
+        <div className="km-note" style={{ marginTop: 0 }}>
+          Google Apps Script のウェブアプリURLと合言葉（トークン）を設定すると、入力データが自動的にGoogleスプレッドシートへ保存され、別PCでも同じデータを共有できます。
+          未設定の場合はこのPCのみ（ローカル保存）で動作します。
+        </div>
+        <div className="km-form" style={{ marginTop: 10 }}>
+          <Field label="ウェブアプリURL" hint="https://script.google.com/macros/s/.../exec">
+            <input value={cloudUrl} onChange={(e) => setCloudUrl(e.target.value)} placeholder="https://script.google.com/macros/s/XXXX/exec" />
+          </Field>
+          <Field label="合言葉（トークン）" hint="GAS側の TOKEN と一致させる">
+            <input value={cloudToken} onChange={(e) => setCloudToken(e.target.value)} placeholder="mishima-9f3k-2026" />
+          </Field>
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+          <button className="km-btn km-btn-primary" onClick={saveCloudConfig} disabled={cloudBusy}>💾 設定を保存</button>
+          <button className="km-btn" onClick={testCloud} disabled={cloudBusy}>🔌 接続テスト</button>
+          <button className="km-btn" onClick={pushToCloud} disabled={cloudBusy}>⬆ このPCのデータをクラウドへ</button>
+          <button className="km-btn" onClick={pullFromCloud} disabled={cloudBusy}>⬇ クラウドからこのPCへ</button>
+        </div>
+        {cloudMsg && <div className="km-note" style={{ marginTop: 12, color: cloudMsg[0] === "✗" ? "#b4413c" : "var(--accent)" }}>{cloudMsg}</div>}
+        {syncMsg && <div className="km-note" style={{ marginTop: 6, color: syncMsg[0] === "✗" ? "#b4413c" : "var(--dim)" }}>{syncMsg}</div>}
+        <div className="km-note" style={{ marginTop: 12 }}>
+          ※ 接続状態: <b>{KMStore.isCloud() ? "クラウド連携 ON" : "ローカルのみ"}</b>。
+          連携ONのときは、起動時にクラウドのデータを読み込み、入力するたびに自動で保存します（オフライン時はこのPCに保持し、次回接続時に保存）。
+        </div>
+      </div>
+
+      <div className="km-card">
+        <div className="km-cardhead">データのバックアップ・移行</div>
+        <div className="km-note" style={{ marginTop: 0 }}>
+          このPC（Edge）に保存されている全データ（設定・業者・日報・過去CSV・目標）を1つのJSONファイルに書き出し、別のPCで取り込めます。
+          まずは <b>エクスポート</b> でバックアップを取り、USBやメール等で移したファイルを移行先で <b>インポート</b> してください。
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+          <button className="km-btn km-btn-primary" onClick={doExport}>📤 エクスポート（バックアップ保存）</button>
+          <label className="km-btn" style={{ cursor: "pointer", margin: 0 }}>
+            📥 インポート（バックアップ取込）
+            <input type="file" accept="application/json,.json" onChange={onImportFile} style={{ display: "none" }} />
+          </label>
+        </div>
+        {bkMsg && <div className="km-note" style={{ marginTop: 12, color: bkMsg[0] === "✗" ? "#b4413c" : "var(--accent)" }}>{bkMsg}</div>}
+        <div className="km-note" style={{ marginTop: 12 }}>
+          ※ インポートは現在のデータを<b>置き換え</b>ます（追記ではありません）。取込前に念のため現在のデータもエクスポートしておくと安全です。
+        </div>
+      </div>
+
+      <div className="km-card">
+        <div className="km-cardhead">店舗・当月設定</div>
+        <div className="km-form">
+          <Field label="店舗名"><input value={settings.storeName} onChange={set("storeName")} /></Field>
+          <Field label="運営会社"><input value={settings.company} onChange={set("company")} /></Field>
+          <Field label="当月営業日数"><input type="number" value={settings.businessDays} onChange={set("businessDays")} /></Field>
+          <Field label="計画売上（円）"><input type="number" value={settings.planSales} onChange={set("planSales")} /></Field>
+          <Field label="前月売上（税抜・円）"><input type="number" value={settings.prevSales} onChange={set("prevSales")} /></Field>
+          <Field label="想定原価率" hint="空欄なら標準40.5%"><input type="number" step="0.001" placeholder="0.405" value={settings.assumedGenkaRate} onChange={set("assumedGenkaRate")} /></Field>
+        </div>
+        <div className="km-subhead">固定費（月額・税抜・円）</div>
+        <div className="km-form">
+          <Field label="社員給与（固定）"><input type="number" value={settings.fixedLabor} onChange={set("fixedLabor")} /></Field>
+          <Field label="アルバイト1人当たり日額（円）" hint="既定 7,500"><input type="number" value={settings.partRate} onChange={set("partRate")} /></Field>
+          <Field label="家賃"><input type="number" value={settings.rent} onChange={set("rent")} /></Field>
+          <Field label="減価償却費"><input type="number" value={settings.depreciation} onChange={set("depreciation")} /></Field>
+          <Field label="借入元金返済"><input type="number" value={settings.loanRepay} onChange={set("loanRepay")} /></Field>
+          <Field label="ロイヤリティ率" hint="標準0.05"><input type="number" step="0.001" value={settings.royaltyRate} onChange={set("royaltyRate")} /></Field>
+        </div>
+        <div className="km-note">
+          これらは速報予測の固定費・売上連動費の見積りに使われ、月次突合フェーズで請求書の確定値に置き換えます。
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================== 前年比較・対目標 ==============================
+function YoY({ history, setHistory, targets, setTargets, reports, setReports }) {
+  const [msg, setMsg] = useState("");
+  const [view, setView] = useState("month"); // day / month / year
+  const [busy, setBusy] = useState(false);
+  const [reflectMsg, setReflectMsg] = useState("");
+
+  const onFiles = async (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setBusy(true); setMsg("");
+    try {
+      let added = 0;
+      const map = {};
+      for (const r of history) map[r.date] = r;
+      for (const f of files) {
+        const rows = await readAirmateCSV(f);
+        for (const row of rows) { map[row.date] = row; added++; }
+      }
+      const merged = Object.values(map).sort((a, b) => (a.date < b.date ? -1 : 1));
+      setHistory(merged);
+      setMsg(`${files.length}ファイル / ${added}行を取り込みました（合計 ${merged.length}日分）`);
+    } catch (err) {
+      setMsg("取込エラー: " + err.message);
+    } finally {
+      setBusy(false);
+      e.target.value = "";
+    }
+  };
+
+  // 取込CSV(history)全期間を日報(reports)へ反映。
+  // 税込売上(salesInc)と客数(guests)を入れ、消費税額は空のまま。
+  // 既存日報がある日は税込売上・客数のみ上書きし、他項目は維持。
+  const reflectToReports = () => {
+    if (!history.length) return;
+    setReports((prev) => {
+      const map = {};
+      for (const r of prev) map[r.date] = { ...r };
+      let updated = 0, created = 0;
+      for (const h of history) {
+        if (!h.date) continue;
+        const inc = Number(h.sales) || 0;
+        const g = Number(h.guests) || 0;
+        if (inc === 0 && g === 0) continue;
+        if (map[h.date]) {
+          map[h.date] = { ...map[h.date], salesInc: String(inc), guests: String(g) };
+          updated++;
+        } else {
+          map[h.date] = { date: h.date, salesInc: String(inc), guests: String(g), buys: {} };
+          created++;
+        }
+      }
+      setReflectMsg(`日報へ反映しました（新規 ${created}日 / 上書き ${updated}日）。消費税額は空欄なので、税抜売上が必要な月は日報入力で補ってください。`);
+      return Object.values(map).sort((a, b) => (a.date < b.date ? -1 : 1));
+    });
+  };
+
+  // 当月の日報(reports)を history に重ねる。日報の税込売上・客数を当年データとして使う。
+  // CSVより日報が新しい想定なので、当月分は日報優先で上書き。
+  const mergedHistory = useMemo(() => {
+    const map = {};
+    for (const r of history) map[r.date] = { ...r };
+    // 当月 = 日報の最新年月
+    const repDates = reports.map((r) => r.date).filter(Boolean);
+    const curYM = repDates.length ? ymOf(repDates.sort().reverse()[0]) : null;
+    for (const r of reports) {
+      if (!r.date) continue;
+      if (curYM && ymOf(r.date) !== curYM) continue; // 当月分のみ反映
+      const inc = Number(r.salesInc) || 0;
+      const g = Number(r.guests) || 0;
+      if (inc === 0 && g === 0) continue;
+      const dow = WEEKDAY_JP[new Date(r.date + "T00:00:00").getDay()];
+      const prevRow = map[r.date] || {};
+      map[r.date] = { ...prevRow, date: r.date, sales: inc, guests: g, dow: prevRow.dow || dow, fromReport: true };
+    }
+    return Object.values(map).sort((a, b) => (a.date < b.date ? -1 : 1));
+  }, [history, reports]);
+
+  const byDate = useMemo(() => {
+    const m = {}; for (const r of mergedHistory) m[r.date] = r; return m;
+  }, [mergedHistory]);
+
+  const prevYearDate = (d) => {
+    const [y, m, day] = d.split("-");
+    return `${Number(y) - 1}-${m}-${day}`;
+  };
+
+  // 曜日を求める（CSVのdowが無い場合の補完にも使用）
+  const dowOf = (d) => {
+    const r = byDate[d];
+    if (r && r.dow) return r.dow;
+    return WEEKDAY_JP[new Date(d + "T00:00:00").getDay()];
+  };
+
+  const monthLabel = (ym) => `${Number(ym.slice(0, 4))}年${Number(ym.slice(5, 7))}月`;
+  // 月計の目標 = その月の日別手入力目標の合計（無ければ空）
+  const sumManualDaily = (curArr, dailyTargets) => {
+    let sum = 0, any = false;
+    for (const r of curArr) {
+      const v = dailyTargets[r.date];
+      if (v != null && v !== "") { sum += Number(v) || 0; any = true; }
+    }
+    return any ? String(sum) : "";
+  };
+
+  function mkRow(key, dow, cur, prev, manualTarget) {
+    const sum = (arr, f) => arr.reduce((s, x) => s + f(x), 0);
+    const sales = sum(cur, (x) => x.sales);
+    const guests = sum(cur, (x) => x.guests);
+    const perGuest = guests > 0 ? sales / guests : 0;
+    const pHasData = prev.length > 0;
+    const pSales = pHasData ? sum(prev, (x) => x.sales) : sum(cur, (x) => x.lastSales || 0);
+    const pGuests = pHasData ? sum(prev, (x) => x.guests) : 0;
+    const pPer = pGuests > 0 ? pSales / pGuests : 0;
+    const amTarget = sum(cur, (x) => x.target || 0);
+    const target = manualTarget != null && manualTarget !== "" ? Number(manualTarget) : amTarget;
+    return {
+      key, dow, sales, guests, perGuest,
+      target,
+      salesYoY: pSales > 0 ? sales / pSales : null,
+      salesDelta: pSales > 0 ? sales - pSales : null,
+      guestsDelta: pHasData ? guests - pGuests : null,
+      perDelta: pHasData && pPer > 0 ? perGuest - pPer : null,
+      achieve: target > 0 ? sales / target : null,
+      diff: target > 0 ? sales - target : null,
+    };
+  }
+
+  // 日別: 月ごとに区切る（[{type:'header',ym}, {type:'row',...}, {type:'subtotal',...}]）
+  // 月別: 年ごとに区切る（1月〜12月）
+  const sections = useMemo(() => {
+    if (mergedHistory.length === 0) return [];
+    if (view === "day") {
+      // 月でグループ化（新しい月が上）
+      const byMonth = {};
+      for (const r of mergedHistory) {
+        const ym = ymOf(r.date);
+        (byMonth[ym] = byMonth[ym] || []).push(r);
+      }
+      return Object.keys(byMonth).sort().reverse().map((ym) => {
+        const rows = byMonth[ym].sort((a, b) => (a.date < b.date ? 1 : -1)).map((r) => {
+          const prev = byDate[prevYearDate(r.date)];
+          const row = mkRow(r.date, r.dow || dowOf(r.date), [r], prev ? [prev] : [], targets.daily[r.date]);
+          row.tkey = r.date; row.tscope = "daily";
+          return row;
+        });
+        // 月計
+        const curArr = byMonth[ym];
+        const prevArr = curArr.map((r) => byDate[prevYearDate(r.date)]).filter(Boolean);
+        const sub = mkRow(monthLabel(ym) + " 計", "", curArr, prevArr, sumManualDaily(curArr, targets.daily));
+        return { ym, label: monthLabel(ym), rows, sub };
+      });
+    }
+    if (view === "month") {
+      // 年でグループ化（1月〜12月の順、新しい年が上）
+      const byYear = {};
+      for (const r of mergedHistory) {
+        const y = yOf(r.date);
+        (byYear[y] = byYear[y] || []).push(r);
+      }
+      return Object.keys(byYear).sort().reverse().map((y) => {
+        // その年の月リスト（1月→12月）
+        const monthsInYear = {};
+        for (const r of byYear[y]) {
+          const ym = ymOf(r.date);
+          (monthsInYear[ym] = monthsInYear[ym] || []).push(r);
+        }
+        const rows = Object.keys(monthsInYear).sort().map((ym) => {
+          const cur = monthsInYear[ym];
+          const prevYM = `${Number(y) - 1}${ym.slice(4)}`;
+          const prev = mergedHistory.filter((r) => ymOf(r.date) === prevYM);
+          const row = mkRow(monthLabel(ym), "", cur, prev, targets.monthly[ym]);
+          row.tkey = ym; row.tscope = "monthly";
+          return row;
+        });
+        // 年計
+        const curArr = byYear[y];
+        const prevArr = mergedHistory.filter((r) => yOf(r.date) === String(Number(y) - 1));
+        const sub = mkRow(y + "年 計", "", curArr, prevArr, targets.yearly[y]);
+        return { ym: y, label: y + "年", rows, sub };
+      });
+    }
+    // 年ビュー（従来通り、年ごと1行）
+    const byYear = {};
+    for (const r of mergedHistory) {
+      const y = yOf(r.date);
+      (byYear[y] = byYear[y] || []).push(r);
+    }
+    const rows = Object.keys(byYear).sort().reverse().map((y) => {
+      const cur = byYear[y];
+      const prev = byYear[String(Number(y) - 1)] || [];
+      const row = mkRow(y + "年", "", cur, prev, targets.yearly[y]);
+      row.tkey = y; row.tscope = "yearly";
+      return row;
+    });
+    return [{ ym: "all", label: "", rows, sub: null }];
+  }, [mergedHistory, view, byDate, targets]);
+
+  const setTarget = (scope, key) => (e) => {
+    const v = e.target.value;
+    setTargets((t) => ({ ...t, [scope]: { ...t[scope], [key]: v } }));
+  };
+
+  return (
+    <div className="km-page">
+      <div className="km-card">
+        <div className="km-cardhead">エアメイトCSV取込</div>
+        <div className="km-note" style={{ marginTop: 0, marginBottom: 12 }}>
+          エアメイトの「日次サマリ」または「日別売上月報」CSV（Shift-JIS可）を選択します。形式は自動判別します。
+          当年・前年の両方を取り込むと、客数・客単価の前年比も日付マッチングで算出します。同じ日付は新しい取込で上書きされます。
+        </div>
+        <label className="km-upload">
+          <input type="file" accept=".csv" multiple onChange={onFiles} disabled={busy} />
+          <span>{busy ? "取込中…" : "CSVファイルを選択（複数可）"}</span>
+        </label>
+        {msg && <div className="km-msg">{msg}</div>}
+
+        {history.length > 0 && (
+          <div className="km-reflect">
+            <div className="km-reflect-head">取込CSVを日報へ反映</div>
+            <div className="km-note" style={{ marginTop: 0, marginBottom: 10 }}>
+              取り込んだCSV全期間（{history.length}日分）の<b>税込売上・客数</b>を日報に書き込みます。
+              消費税額は空欄のまま入るので、税抜売上が必要な月は後から日報入力で消費税額を補ってください。
+              既存の日報がある日は税込売上・客数のみ上書きし、消費税額・仕入などの他項目は残します。
+            </div>
+            <button className="km-reflect-btn" onClick={reflectToReports}>
+              CSV全期間を日報へ反映する
+            </button>
+            {reflectMsg && <div className="km-msg">{reflectMsg}</div>}
+          </div>
+        )}
+      </div>
+
+      {mergedHistory.length === 0 ? (
+        <Empty title="まだ取込データがありません" body="上のボタンからエアメイトのCSVを取り込むか、日報を入力すると、前年比・対目標がここに表示されます。" />
+      ) : (
+        <div className="km-card">
+          <div className="km-cardhead-row">
+            <div className="km-cardhead">前年比較・対目標</div>
+            <div className="km-seg">
+              {[["day", "日"], ["month", "月"], ["year", "年"]].map(([k, l]) => (
+                <button key={k} className={"km-segbtn" + (view === k ? " on" : "")} onClick={() => setView(k)}>{l}</button>
+              ))}
+            </div>
+          </div>
+
+          <div className="km-tablewrap">
+            <table className="km-table yoy">
+              <thead>
+                <tr>
+                  <th>{view === "day" ? "日付" : view === "month" ? "月" : "年"}</th>
+                  <th className="r">売上</th>
+                  <th className="r">前年比</th>
+                  <th className="r">前年差</th>
+                  <th className="r">客数</th>
+                  <th className="r">前年差</th>
+                  <th className="r">客単価</th>
+                  <th className="r">前年差</th>
+                  <th className="r">目標</th>
+                  <th className="r">達成率</th>
+                  <th className="r">差分</th>
+                </tr>
+              </thead>
+              <tbody>
+                {sections.map((sec) => (
+                  <React.Fragment key={sec.ym}>
+                    {sec.label && (
+                      <tr className="km-secdiv">
+                        <td colSpan={11}>{sec.label}</td>
+                      </tr>
+                    )}
+                    {sec.rows.map((p) => (
+                      <tr key={p.key}>
+                        <td className="mono nowrap">{p.key}{p.dow ? `(${p.dow})` : ""}</td>
+                        <td className="r mono">{yen(p.sales)}</td>
+                        <td className={"r mono " + yoyCls(p.salesYoY)}>{yoyTxt(p.salesYoY)}</td>
+                        <td className={"r mono " + deltaCls(p.salesDelta)}>{deltaYen(p.salesDelta)}</td>
+                        <td className="r mono">{p.guests.toLocaleString()}</td>
+                        <td className={"r mono " + deltaCls(p.guestsDelta)}>{deltaNum(p.guestsDelta, "人")}</td>
+                        <td className="r mono">{yen(p.perGuest)}</td>
+                        <td className={"r mono " + deltaCls(p.perDelta)}>{deltaYen(p.perDelta)}</td>
+                        <td className="r">
+                          <input className="km-tgt" type="number" placeholder={p.target || "0"}
+                            value={targets[p.tscope][p.tkey] ?? ""} onChange={setTarget(p.tscope, p.tkey)} />
+                        </td>
+                        <td className={"r mono " + (p.achieve >= 1 ? "pos" : p.achieve != null ? "neg" : "")}>{pct(p.achieve)}</td>
+                        <td className={"r mono " + (p.diff >= 0 ? "pos" : p.diff != null ? "neg" : "")}>{p.diff != null ? (p.diff >= 0 ? "+" : "") + yen(p.diff) : "—"}</td>
+                      </tr>
+                    ))}
+                    {sec.sub && (
+                      <tr className="em">
+                        <td className="nowrap">{sec.sub.key}</td>
+                        <td className="r mono">{yen(sec.sub.sales)}</td>
+                        <td className={"r mono " + yoyCls(sec.sub.salesYoY)}>{yoyTxt(sec.sub.salesYoY)}</td>
+                        <td className={"r mono " + deltaCls(sec.sub.salesDelta)}>{deltaYen(sec.sub.salesDelta)}</td>
+                        <td className="r mono">{sec.sub.guests.toLocaleString()}</td>
+                        <td className={"r mono " + deltaCls(sec.sub.guestsDelta)}>{deltaNum(sec.sub.guestsDelta, "人")}</td>
+                        <td className="r mono">{yen(sec.sub.perGuest)}</td>
+                        <td className={"r mono " + deltaCls(sec.sub.perDelta)}>{deltaYen(sec.sub.perDelta)}</td>
+                        <td className="r mono">{sec.sub.target > 0 ? yen(sec.sub.target) : "—"}</td>
+                        <td className={"r mono " + (sec.sub.achieve >= 1 ? "pos" : sec.sub.achieve != null ? "neg" : "")}>{pct(sec.sub.achieve)}</td>
+                        <td className={"r mono " + (sec.sub.diff >= 0 ? "pos" : sec.sub.diff != null ? "neg" : "")}>{sec.sub.diff != null ? (sec.sub.diff >= 0 ? "+" : "") + yen(sec.sub.diff) : "—"}</td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="km-note">
+            当月分は日報の入力値（税込売上・客数）を反映しています。「—」は前年同期間のデータ未取込を示します。
+            目標欄は手入力で上書きでき、空欄ならエアメイトの売上目標を使います。
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function yoyTxt(r) {
+  if (r == null || !isFinite(r)) return "—";
+  return (r >= 1 ? "+" : "") + ((r - 1) * 100).toFixed(1) + "%";
+}
+function yoyCls(r) {
+  if (r == null || !isFinite(r)) return "dim";
+  return r >= 1 ? "pos" : "neg";
+}
+function deltaYen(n) {
+  if (n == null || !isFinite(n)) return "—";
+  return (n >= 0 ? "+" : "−") + "¥" + Math.abs(Math.round(n)).toLocaleString("ja-JP");
+}
+function deltaNum(n, unit) {
+  if (n == null || !isFinite(n)) return "—";
+  return (n >= 0 ? "+" : "−") + Math.abs(Math.round(n)).toLocaleString("ja-JP") + (unit || "");
+}
+function deltaCls(n) {
+  if (n == null || !isFinite(n)) return "dim";
+  return n >= 0 ? "pos" : "neg";
+}
+
+function Empty({ title, body }) {
+  return (
+    <div className="km-page">
+      <div className="km-card empty">
+        <div className="km-empty-title">{title}</div>
+        <div className="km-empty-body">{body}</div>
+      </div>
+    </div>
+  );
+}
+
+// ============================== スタイル ==============================
+const CSS = `
+.km-root{--ink:#1a1d1f;--paper:#faf8f3;--card:#ffffff;--line:#e7e2d6;
+  --accent:#1f6e54;--accent-soft:#e6f0eb;--gold:#b8893a;--neg:#c0392b;--dim:#8a8578;
+  font-family:-apple-system,"Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+  color:var(--ink);background:var(--paper);min-height:100vh;}
+*{box-sizing:border-box}
+.km-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;
+  padding:18px 24px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}
+.km-brand{display:flex;align-items:center;gap:12px}
+.km-mark{width:40px;height:40px;border-radius:10px;background:var(--accent);color:#fff;
+  display:grid;place-items:center;font-size:20px;font-weight:700}
+.km-title{font-size:18px;font-weight:700;letter-spacing:.02em}
+.km-sub{font-size:12px;color:var(--dim)}
+.km-nav{display:flex;gap:4px;background:var(--paper);padding:4px;border-radius:10px;border:1px solid var(--line)}
+.km-navbtn{border:0;background:transparent;padding:8px 16px;border-radius:7px;font-size:13px;
+  font-weight:600;color:var(--dim);cursor:pointer;font-family:inherit}
+.km-navbtn.on{background:var(--card);color:var(--accent);box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.km-main{max-width:880px;margin:0 auto;padding:24px}
+.km-page{display:flex;flex-direction:column;gap:16px}
+.km-row{display:flex;gap:16px;flex-wrap:wrap}
+.km-card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
+.km-card.hero{flex:1;min-width:280px;background:linear-gradient(135deg,#fff,var(--accent-soft))}
+.km-label{font-size:12px;color:var(--dim);font-weight:600;letter-spacing:.04em}
+.km-big{font-size:42px;font-weight:800;line-height:1.1;margin:6px 0;font-variant-numeric:tabular-nums}
+.km-big.pos{color:var(--accent)}.km-big.neg{color:var(--neg)}
+.km-herometa{font-size:13px;color:#555}
+.km-vs{margin-left:10px;color:var(--gold);font-weight:600}
+.km-progress{height:8px;background:#eee;border-radius:99px;margin:14px 0 6px;overflow:hidden}
+.km-progress-bar{height:100%;background:var(--accent);border-radius:99px;transition:width .4s}
+.km-progress-meta{font-size:12px;color:var(--dim)}
+.km-stats{gap:12px}
+.km-card.stat{flex:1;min-width:150px;padding:16px}
+.km-statval{font-size:22px;font-weight:700;margin-top:4px;font-variant-numeric:tabular-nums}
+.km-statsub{font-size:11px;color:var(--dim);margin-top:2px}
+.km-cardhead{font-size:15px;font-weight:700;margin-bottom:14px}
+.km-subhead{font-size:13px;font-weight:600;color:var(--accent);margin:18px 0 10px}
+.km-table{width:100%;border-collapse:collapse;font-size:13px}
+.km-table th{text-align:left;color:var(--dim);font-weight:600;font-size:11px;
+  padding:6px 8px;border-bottom:2px solid var(--line)}
+.km-table td{padding:9px 8px;border-bottom:1px solid var(--line)}
+.km-table tr.em td{font-weight:700;background:var(--accent-soft)}
+.km-table .r{text-align:right}.mono{font-variant-numeric:tabular-nums}
+.dim{color:var(--dim)}.pos{color:var(--accent)}.neg{color:var(--neg)}
+.km-note{font-size:11px;color:var(--dim);margin-top:12px;line-height:1.5}
+.km-total{margin-top:10px;font-size:14px;color:#444}
+.km-total b{color:var(--accent);font-size:16px;font-variant-numeric:tabular-nums}
+.km-total-sub{margin-left:8px;font-size:12px;color:var(--dim)}
+.km-existing{margin-top:12px;padding:12px 14px;background:#fff7e6;border:1px solid #f0d9a8;
+  border-radius:10px;font-size:13px;color:#7a5a1e;line-height:1.6}
+.km-existing b{color:#a06a10}
+.km-loadbtn{display:inline-block;margin-left:8px;margin-top:6px;border:1px solid var(--gold);
+  background:#fff;color:var(--gold);padding:5px 12px;border-radius:7px;font-size:12px;
+  font-weight:700;cursor:pointer;font-family:inherit}
+.km-loadbtn:hover{background:var(--gold);color:#fff}
+.km-vrow{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
+.km-vadd{border-bottom:2px solid var(--line);padding-bottom:14px;margin-bottom:6px}
+.km-vname,.km-vname-static{flex:1}
+.km-vname{padding:9px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;font-family:inherit;background:#fdfdfb}
+.km-vname-static{font-size:14px;font-weight:600}
+.km-vrow select{padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;background:#fdfdfb}
+.km-add{border:0;background:var(--accent);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
+.km-vlist{margin-top:4px}
+.km-cardhead-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.km-cardhead-row .km-cardhead{margin-bottom:0}
+.km-seg{display:flex;gap:2px;background:var(--paper);padding:3px;border-radius:9px;border:1px solid var(--line)}
+.km-segbtn{border:0;background:transparent;padding:6px 16px;border-radius:6px;font-size:13px;font-weight:600;color:var(--dim);cursor:pointer;font-family:inherit}
+.km-segbtn.on{background:var(--accent);color:#fff}
+.km-upload{display:flex;align-items:center;justify-content:center;gap:8px;padding:18px;border:2px dashed var(--line);border-radius:12px;cursor:pointer;background:#fdfdfb;position:relative}
+.km-upload:hover{border-color:var(--accent);background:var(--accent-soft)}
+.km-upload input{position:absolute;inset:0;opacity:0;cursor:pointer}
+.km-upload span{font-size:14px;font-weight:600;color:var(--accent)}
+.km-msg{margin-top:12px;font-size:13px;color:#2c6;background:var(--accent-soft);padding:10px 14px;border-radius:9px}
+.km-reflect{margin-top:16px;padding-top:16px;border-top:1px dashed var(--line)}
+.km-reflect-head{font-size:14px;font-weight:700;margin-bottom:8px;color:var(--accent)}
+.km-reflect-btn{border:0;background:var(--gold);color:#fff;padding:11px 20px;border-radius:9px;
+  font-size:14px;font-weight:700;cursor:pointer;font-family:inherit}
+.km-reflect-btn:hover{filter:brightness(1.05)}
+.km-btn{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:#fff;
+  color:var(--ink,#1f2a24);padding:10px 18px;border-radius:9px;font-size:14px;font-weight:600;
+  cursor:pointer;font-family:inherit;line-height:1.2}
+.km-btn:hover{border-color:var(--accent);color:var(--accent)}
+.km-btn-primary{border:0;background:var(--accent);color:#fff}
+.km-btn-primary:hover{filter:brightness(1.06);color:#fff}
+.km-tablewrap{overflow-x:auto;margin:0 -4px}
+.km-table.yoy{min-width:880px}
+.km-table.yoy th,.km-table.yoy td{padding:7px 8px;font-size:12.5px}
+.nowrap{white-space:nowrap}
+.km-tgt{width:92px;padding:5px 8px;border:1px solid var(--line);border-radius:7px;font-size:12px;
+  font-family:inherit;text-align:right;background:#fdfdfb;font-variant-numeric:tabular-nums}
+.km-tgt:focus{outline:2px solid var(--accent);border-color:transparent}
+.km-monthsel{padding:7px 12px;border:1px solid var(--line);border-radius:8px;font-size:13px;
+  font-family:inherit;background:#fdfdfb;font-weight:600;color:var(--ink)}
+.km-table tfoot tr.em td{font-weight:700;background:var(--accent-soft);border-top:2px solid var(--line)}
+.km-wx-row{display:flex;gap:8px}
+.km-wx-row input{flex:1}
+.km-wx-btn{border:1px solid var(--accent);background:#fff;color:var(--accent);padding:0 14px;
+  border-radius:9px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit;white-space:nowrap}
+.km-wx-btn:hover{background:var(--accent);color:#fff}
+.km-wx-btn:disabled{opacity:.5;cursor:not-allowed}
+.km-wx-err{margin-top:6px;font-size:12px;color:var(--neg)}
+.km-textarea{padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;
+  font-family:inherit;background:#fdfdfb;resize:vertical;width:100%}
+.km-textarea:focus{outline:2px solid var(--accent);border-color:transparent}
+.km-wx-cell{font-size:12px;white-space:nowrap}
+.km-note-cell{font-size:12px;max-width:200px;color:#555}
+.km-secdiv td{background:#eef4f1;font-weight:700;color:var(--accent);font-size:13px;padding:8px 10px;
+  position:sticky;left:0}
+.km-tgt-tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.km-avgbtn{border:1px solid var(--gold);background:#fff;color:var(--gold);padding:8px 14px;
+  border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
+.km-avgbtn:hover{background:var(--gold);color:#fff}
+.km-tgt-note{font-size:12px;color:var(--dim)}
+.km-addrow{display:flex;gap:10px;align-items:center;margin-bottom:14px}
+.km-addrow input{padding:9px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;font-family:inherit;background:#fdfdfb}
+.km-cal-nav{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.km-cal-arrow{width:32px;height:32px;border:1px solid var(--line);background:#fff;border-radius:8px;
+  font-size:18px;line-height:1;cursor:pointer;color:var(--accent);font-family:inherit}
+.km-cal-arrow:hover{background:var(--accent-soft)}
+.km-cal-month{font-size:16px;font-weight:700;min-width:120px;text-align:center}
+.km-cal-total{margin-left:auto;font-size:13px;color:var(--accent);font-weight:600}
+.km-cal{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+.km-cal-wd{text-align:center;font-size:12px;font-weight:700;color:var(--dim);padding:4px 0}
+.km-cal-wd.sun{color:#c0392b}.km-cal-wd.sat{color:#2a6dbb}
+.km-cal-cell{border:1px solid var(--line);border-radius:8px;padding:5px;min-height:56px;background:#fdfdfb;display:flex;flex-direction:column;gap:3px}
+.km-cal-cell.empty{border:0;background:transparent}
+.km-cal-cell.sun{background:#fdf3f2}.km-cal-cell.sat{background:#f2f6fc}
+.km-cal-day{font-size:12px;font-weight:700;color:#555}
+.km-cal-input{width:100%;border:1px solid var(--line);border-radius:6px;padding:4px 5px;font-size:12px;
+  font-family:inherit;text-align:right;background:#fff;font-variant-numeric:tabular-nums}
+.km-cal-input:focus{outline:2px solid var(--accent);border-color:transparent}
+@media(max-width:560px){.km-cal{gap:3px}.km-cal-cell{padding:3px;min-height:48px}.km-cal-input{font-size:11px;padding:3px}}
+.km-bars{display:flex;flex-direction:column;gap:8px}
+.km-bar-row{display:flex;align-items:center;gap:10px}
+.km-bar-lbl{width:60px;font-size:12px}
+.km-bar-track{flex:1;height:18px;background:#f0ede5;border-radius:6px;overflow:hidden}
+.km-bar-fill{height:100%;background:var(--gold);border-radius:6px}
+.km-bar-val{width:90px;text-align:right;font-size:12px}
+.km-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+.km-field{display:flex;flex-direction:column;gap:5px}
+.km-field-lbl{font-size:12px;font-weight:600;color:#444}
+.km-field input{padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+  font-size:15px;font-family:inherit;background:#fdfdfb}
+.km-field input:focus{outline:2px solid var(--accent);border-color:transparent}
+.km-field-hint{font-size:11px;color:var(--gold)}
+.km-primary{margin-top:18px;width:100%;padding:13px;border:0;border-radius:10px;
+  background:var(--accent);color:#fff;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit}
+.km-primary:disabled{background:#c5ccc8;cursor:not-allowed}
+.km-del{border:1px solid var(--line);background:#fff;color:var(--neg);
+  padding:4px 10px;border-radius:6px;font-size:12px;cursor:pointer}
+.km-card.empty{text-align:center;padding:48px 20px}
+.km-empty-title{font-size:17px;font-weight:700;margin-bottom:8px}
+.km-empty-body{font-size:13px;color:var(--dim);line-height:1.6;max-width:380px;margin:0 auto}
+.km-foot{text-align:center;font-size:11px;color:var(--dim);padding:20px}
+@media(max-width:560px){.km-main{padding:14px}.km-big{font-size:34px}}
+`;
+
+
+const rootEl = document.getElementById("root");
+ReactDOM.createRoot(rootEl).render(<App />);
+</script>
+</body>
+</html>
