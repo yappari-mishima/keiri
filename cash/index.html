@@ -456,7 +456,7 @@ function(a,b,c){if(!Vd(b))throw Error(m(200));return Wd(null,a,b,!1,c)};Q.unmoun
 <body>
 <div id="root"></div>
 <script>
-window.addEventListener("error",function(e){var r=document.getElementById("root");if(r&&!r.hasChildNodes()){r.innerHTML='<div style="padding:24px;color:#9e2b2b"><b>読み込みエラー</b><br><pre>'+(e.message||e)+'</pre></div>';}});
+window.addEventListener("error",function(e){var r=document.getElementById("root");if(r&&!r.hasChildNodes()){r.innerHTML='<div style="padding:24px;color:#9e2b2b"><b>エラー</b><br><pre>'+(e.message||e)+'</pre></div>';}});
 </script>
 <script>
 try{
@@ -700,23 +700,57 @@ function App() {
     toastT.current = setTimeout(() => setToast(''), 1800);
   }, []);
 
-  // running balances over sorted ledger
+  // 帳簿まるごと復元（JSON読み込み）
+  const restoreAll = useCallback(data => {
+    if (data.settings) setSettings({
+      ...DEF_SETTINGS,
+      ...data.settings
+    });
+    if (Array.isArray(data.ledger)) setLedger(data.ledger);
+    if (data.counts && typeof data.counts === 'object') setCounts(data.counts);
+    if (data.confirms && typeof data.confirms === 'object') setConfirms(data.confirms);
+  }, []);
+
+  // running balances + 精算済み判定（立替の現金支出をFIFOで精算入金と相殺）
   const computed = useMemo(() => {
     const sorted = [...ledger].sort((a, b) => (a.date || '').localeCompare(b.date || '') || (a.id > b.id ? 1 : -1));
     let cash = 0,
       rec = 0,
       hq = 0;
     const rows = [];
+    // FIFO精算：未精算の現金支出キュー
+    const pending = []; // {ref to row, remaining}
+    let settlePool = 0;
     for (const r of sorted) {
       cash += (+r.inc || 0) - (+r.out || 0);
       rec += +r.receiptDelta || 0;
       hq += +r.hqDelta || 0;
-      rows.push({
+      const row = {
         ...r,
         cashBal: cash,
         recBal: rec,
-        hqBal: hq
-      });
+        hqBal: hq,
+        settled: false,
+        outstanding: 0
+      };
+      if (r.kind === '現金支出') {
+        row.outstanding = +r.out || 0;
+        pending.push(row);
+      } else if (r.kind === '本社精算入金') {
+        settlePool += +r.inc || 0;
+      }
+      rows.push(row);
+    }
+    // 精算プールを古い立替から消し込む
+    for (const p of pending) {
+      if (settlePool <= 0) break;
+      const use = Math.min(p.outstanding, settlePool);
+      p.outstanding -= use;
+      settlePool -= use;
+      if (p.outstanding <= 0.0001) {
+        p.settled = true;
+        p.outstanding = 0;
+      }
     }
     return {
       rows,
@@ -763,7 +797,8 @@ function App() {
     showToast: showToast,
     ledger: ledger,
     counts: counts,
-    confirms: confirms
+    confirms: confirms,
+    restoreAll: restoreAll
   }), toast && /*#__PURE__*/React.createElement("div", {
     className: "toast"
   }, toast));
@@ -788,7 +823,49 @@ function Ledger({
   const [f, setF] = useState(blank);
   const [editId, setEditId] = useState(null);
   const [asc, setAsc] = useState(false); // 表示順：false=新しい順(降順)
+  const [view, setView] = useState('all'); // all=全件 / month=月別 / pending=未精算の立替のみ
+  const [ym, setYm] = useState(ymOf(todayISO())); // 月別フィルタの対象月
 
+  // 月別の選択肢（取引のある月＋直近12ヶ月）
+  const monthOptions = useMemo(() => {
+    const set = new Set();
+    ledger.forEach(r => {
+      if (r.date) set.add(r.date.slice(0, 7));
+    });
+    const now = new Date();
+    for (let i = 0; i < 12; i++) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      set.add(d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'));
+    }
+    return [...set].sort().reverse();
+  }, [ledger]);
+
+  // 表示する行を view に応じて絞る（comp.rows は時系列・残高計算済み）
+  const shownRows = useMemo(() => {
+    let rows = comp.rows;
+    if (view === 'month') rows = rows.filter(r => (r.date || '').slice(0, 7) === ym);else if (view === 'pending') rows = rows.filter(r => r.kind === '現金支出' && !r.settled);
+    return asc ? rows : [...rows].reverse();
+  }, [comp.rows, view, ym, asc]);
+
+  // 月別表示のときの繰越（その月より前の最終残高）
+  const carryBefore = useMemo(() => {
+    if (view !== 'month') return null;
+    const before = comp.rows.filter(r => (r.date || '').slice(0, 7) < ym);
+    if (!before.length) return {
+      cashBal: 0,
+      recBal: 0,
+      hqBal: 0
+    };
+    const last = before[before.length - 1];
+    return {
+      cashBal: last.cashBal,
+      recBal: last.recBal,
+      hqBal: last.hqBal
+    };
+  }, [comp.rows, view, ym]);
+
+  // 未精算の立替合計（FIFO残＝outstanding を合計。部分精算も正しく反映）
+  const pendingTotal = useMemo(() => comp.rows.filter(r => r.kind === '現金支出' && !r.settled).reduce((s, r) => s + (+r.outstanding || 0), 0), [comp.rows]);
   const hasOpening = ledger.some(r => r.kind === '開始残高');
   function addOpening() {
     const v = settings.koguchi || 0;
@@ -1013,14 +1090,39 @@ function Ledger({
   }, editId ? '更新' : '追加')))), /*#__PURE__*/React.createElement("div", {
     className: "card"
   }, /*#__PURE__*/React.createElement("div", {
-    className: "card-h"
+    className: "card-h",
+    style: {
+      flexWrap: 'wrap',
+      gap: 10
+    }
   }, /*#__PURE__*/React.createElement("h2", null, "出納帳明細"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: 'flex',
       gap: 10,
-      alignItems: 'center'
+      alignItems: 'center',
+      flexWrap: 'wrap'
     }
   }, /*#__PURE__*/React.createElement("div", {
+    className: "seg no-print"
+  }, /*#__PURE__*/React.createElement("button", {
+    "data-on": view === 'all' ? '1' : '0',
+    onClick: () => setView('all')
+  }, "全件"), /*#__PURE__*/React.createElement("button", {
+    "data-on": view === 'month' ? '1' : '0',
+    onClick: () => setView('month')
+  }, "月別"), /*#__PURE__*/React.createElement("button", {
+    "data-on": view === 'pending' ? '1' : '0',
+    onClick: () => setView('pending')
+  }, "未精算の立替")), view === 'month' && /*#__PURE__*/React.createElement("select", {
+    value: ym,
+    onChange: e => setYm(e.target.value),
+    style: {
+      width: 'auto'
+    }
+  }, monthOptions.map(m => /*#__PURE__*/React.createElement("option", {
+    key: m,
+    value: m
+  }, m.replace('-', '年') + '月'))), /*#__PURE__*/React.createElement("div", {
     className: "seg no-print"
   }, /*#__PURE__*/React.createElement("button", {
     "data-on": !asc ? '1' : '0',
@@ -1033,9 +1135,19 @@ function Ledger({
     style: {
       fontSize: 12
     }
-  }, comp.rows.length, "件"))), /*#__PURE__*/React.createElement("div", {
+  }, shownRows.length, "件"))), /*#__PURE__*/React.createElement("div", {
     className: "card-b"
+  }, view === 'pending' && /*#__PURE__*/React.createElement("div", {
+    className: "recon-box",
+    style: {
+      margin: '0 0 12px',
+      maxWidth: 280
+    }
   }, /*#__PURE__*/React.createElement("div", {
+    className: "l"
+  }, "未精算の立替合計（本社へ請求中）"), /*#__PURE__*/React.createElement("div", {
+    className: "v"
+  }, yen(pendingTotal))), /*#__PURE__*/React.createElement("div", {
     className: "tbl-wrap"
   }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "日付"), /*#__PURE__*/React.createElement("th", null, "区分"), /*#__PURE__*/React.createElement("th", null, "内容"), /*#__PURE__*/React.createElement("th", {
     className: "num"
@@ -1047,12 +1159,30 @@ function Ledger({
     className: "num"
   }, "レシート残"), /*#__PURE__*/React.createElement("th", {
     className: "num"
-  }, "本社未入金"), /*#__PURE__*/React.createElement("th", null, "備考"), /*#__PURE__*/React.createElement("th", {
+  }, "本社未入金"), /*#__PURE__*/React.createElement("th", null, "状態"), /*#__PURE__*/React.createElement("th", null, "備考"), /*#__PURE__*/React.createElement("th", {
     className: "no-print"
-  }))), /*#__PURE__*/React.createElement("tbody", null, comp.rows.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: 10,
+  }))), /*#__PURE__*/React.createElement("tbody", null, shownRows.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
+    colSpan: 11,
     className: "empty"
-  }, "まだ取引がありません。上のフォームから入力してください。")), (asc ? comp.rows : [...comp.rows].reverse()).map(r => /*#__PURE__*/React.createElement("tr", {
+  }, view === 'pending' ? '未精算の立替はありません。' : 'この条件の取引はありません。')), view === 'month' && carryBefore && asc && /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: '#efe9dc'
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    className: "muted",
+    colSpan: 5,
+    style: {
+      fontWeight: 700
+    }
+  }, "前月繰越"), /*#__PURE__*/React.createElement("td", {
+    className: "num"
+  }, num(carryBefore.cashBal)), /*#__PURE__*/React.createElement("td", {
+    className: "num"
+  }, num(carryBefore.recBal)), /*#__PURE__*/React.createElement("td", {
+    className: "num"
+  }, num(carryBefore.hqBal)), /*#__PURE__*/React.createElement("td", {
+    colSpan: 3
+  })), shownRows.map(r => /*#__PURE__*/React.createElement("tr", {
     key: r.id
   }, /*#__PURE__*/React.createElement("td", {
     className: "muted",
@@ -1071,7 +1201,13 @@ function Ledger({
     className: "num"
   }, num(r.recBal)), /*#__PURE__*/React.createElement("td", {
     className: "num"
-  }, num(r.hqBal)), /*#__PURE__*/React.createElement("td", {
+  }, num(r.hqBal)), /*#__PURE__*/React.createElement("td", null, r.kind === '現金支出' ? r.settled ? /*#__PURE__*/React.createElement("span", {
+    className: "kind-pill k-settle"
+  }, "精算済") : /*#__PURE__*/React.createElement("span", {
+    className: "kind-pill k-send"
+  }, "立替中", r.outstanding && r.outstanding !== (+r.out || 0) ? '（残' + num(r.outstanding) + '）' : '') : /*#__PURE__*/React.createElement("span", {
+    className: "muted"
+  }, "—")), /*#__PURE__*/React.createElement("td", {
     className: "muted"
   }, r.note), /*#__PURE__*/React.createElement("td", {
     className: "no-print",
@@ -1084,7 +1220,25 @@ function Ledger({
   }, "編集"), ' ', /*#__PURE__*/React.createElement("button", {
     className: "btn danger sm",
     onClick: () => del(r.id)
-  }, "削除"))))))))));
+  }, "削除")))), view === 'month' && carryBefore && !asc && /*#__PURE__*/React.createElement("tr", {
+    style: {
+      background: '#efe9dc'
+    }
+  }, /*#__PURE__*/React.createElement("td", {
+    className: "muted",
+    colSpan: 5,
+    style: {
+      fontWeight: 700
+    }
+  }, "前月繰越"), /*#__PURE__*/React.createElement("td", {
+    className: "num"
+  }, num(carryBefore.cashBal)), /*#__PURE__*/React.createElement("td", {
+    className: "num"
+  }, num(carryBefore.recBal)), /*#__PURE__*/React.createElement("td", {
+    className: "num"
+  }, num(carryBefore.hqBal)), /*#__PURE__*/React.createElement("td", {
+    colSpan: 3
+  }))))))));
 }
 
 /* ---------------- Count tab (小口出納金 実査) ---------------- */
@@ -2030,10 +2184,12 @@ function Settings({
   showToast,
   ledger,
   counts,
-  confirms
+  confirms,
+  restoreAll
 }) {
   const [s, setS] = useState(settings);
-  const fileRef = useRef();
+  const fileRef = useRef(); // 店舗設定の読み込み
+  const restoreRef = useRef(); // 帳簿まるごと復元
   useEffect(() => setS(settings), [settings]);
   function save() {
     setSettings(s);
@@ -2041,6 +2197,7 @@ function Settings({
   }
   function exportAll() {
     const blob = new Blob([JSON.stringify({
+      __type: 'cashmgr-backup',
       settings,
       ledger,
       counts,
@@ -2069,6 +2226,7 @@ function Settings({
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1500);
   }
+  // 設定のみ読み込み（店舗プロファイル／バックアップから設定だけ反映。帳簿は触らない）
   function onImport(e) {
     const f = e.target.files && e.target.files[0];
     if (!f) return;
@@ -2076,7 +2234,7 @@ function Settings({
     rd.onload = () => {
       try {
         const data = JSON.parse(rd.result);
-        if (data.__type === 'cashmgr-profile' && data.settings) {
+        if (data.settings) {
           setS({
             ...DEF_SETTINGS,
             ...data.settings
@@ -2085,20 +2243,35 @@ function Settings({
             ...DEF_SETTINGS,
             ...data.settings
           });
-          showToast('店舗設定を読み込みました');
-        } else if (data.settings) {
-          // フルバックアップ（設定のみ反映。帳簿は上書きしない安全側）
-          setS({
-            ...DEF_SETTINGS,
-            ...data.settings
-          });
-          setSettings({
-            ...DEF_SETTINGS,
-            ...data.settings
-          });
-          showToast('バックアップから設定を反映しました');
+          showToast('設定を読み込みました');
         } else {
           showToast('対応していないファイルです');
+        }
+      } catch (err) {
+        showToast('読み込みに失敗しました');
+      }
+      e.target.value = '';
+    };
+    rd.readAsText(f);
+  }
+  // 帳簿まるごと復元（出納帳・金種表・確認書・設定を全部置き換え）
+  function onRestore(e) {
+    const f = e.target.files && e.target.files[0];
+    if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      try {
+        const data = JSON.parse(rd.result);
+        const hasData = Array.isArray(data.ledger) || data.counts || data.confirms;
+        if (!hasData) {
+          showToast('帳簿データが含まれていません');
+          e.target.value = '';
+          return;
+        }
+        const n = (data.ledger || []).length;
+        if (confirm('現在の帳簿を、読み込んだデータで完全に置き換えます。\n（出納帳' + n + '件・金種表・確認書・設定をすべて上書き）\n今のデータは消えます。よろしいですか？')) {
+          restoreAll && restoreAll(data);
+          showToast('帳簿を復元しました');
         }
       } catch (err) {
         showToast('読み込みに失敗しました');
@@ -2262,12 +2435,12 @@ function Settings({
       margin: '18px 0 8px',
       color: 'var(--ink-soft)'
     }
-  }, "帳簿まるごとバックアップ"), /*#__PURE__*/React.createElement("div", {
+  }, "帳簿まるごとバックアップ・復元"), /*#__PURE__*/React.createElement("div", {
     className: "hint",
     style: {
       marginTop: 0
     }
-  }, "出納帳・金種表・確認書を含む全データをJSONで保存します。PCの故障・買い替えに備え、月末などに保存しておくと安心です。"), /*#__PURE__*/React.createElement("div", {
+  }, "出納帳・金種表・確認書を含む全データをJSONで保存・復元します。PCの故障・買い替えに備え、月末などに保存しておくと安心です。", /*#__PURE__*/React.createElement("b", null, "「復元」は今のデータを上書きします"), "のでご注意ください。"), /*#__PURE__*/React.createElement("div", {
     className: "toolbar",
     style: {
       marginTop: 8
@@ -2275,7 +2448,18 @@ function Settings({
   }, /*#__PURE__*/React.createElement("button", {
     className: "btn",
     onClick: exportAll
-  }, "バックアップ書き出し（全データ）")))));
+  }, "バックアップ書き出し（全データ）"), /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost",
+    onClick: () => restoreRef.current && restoreRef.current.click()
+  }, "バックアップから復元"), /*#__PURE__*/React.createElement("input", {
+    ref: restoreRef,
+    type: "file",
+    accept: "application/json,.json",
+    style: {
+      display: 'none'
+    },
+    onChange: onRestore
+  })))));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(/*#__PURE__*/React.createElement(App, null));
 }catch(err){document.getElementById("root").innerHTML='<div style="padding:24px;color:#9e2b2b"><b>エラー</b><br><pre>'+err.message+'</pre></div>';}
