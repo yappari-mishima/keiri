@@ -635,6 +635,33 @@ function exSalesOf(r) {
   return inc + man;
 }
 
+// 売上が実際に入力されているか（速報の集計対象判定に使う）。
+// salesInc / tax / 旧方式のいずれかに有効値があれば「入力済み」とみなす。
+function hasSalesEntered(r) {
+  if (r.salesInc != null && r.salesInc !== "") return true;
+  if ((r.tax8 != null && r.tax8 !== "") || (r.tax10 != null && r.tax10 !== "")) return true;
+  if (r.salesIncTax != null && r.salesIncTax !== "") return true;
+  if (r.salesExTaxManual != null && r.salesExTaxManual !== "") return true;
+  return false;
+}
+
+// 替え肉券の集計期間：毎月18日配布のため「19日〜翌月18日」を1か月とする。
+// 指定日 date が属する集計期間のキー（締め月 = 18日が属する暦月）を返す。
+// 例: 2026-06-19〜2026-07-18 → キー "2026-07"
+function meatPeriodKey(dateStr) {
+  const y = Number((dateStr || "").slice(0, 4));
+  const m = Number((dateStr || "").slice(5, 7));
+  const d = Number((dateStr || "").slice(8, 10));
+  if (!y || !m || !d) return "";
+  // 19日以降は翌月の期間に属する
+  let py = y, pm = m;
+  if (d >= 19) {
+    pm += 1;
+    if (pm > 12) { pm = 1; py += 1; }
+  }
+  return `${py}-${String(pm).padStart(2, "0")}`;
+}
+
 function App() {
   const [tab, setTab] = useState("dash");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -705,24 +732,65 @@ function App() {
       ? reports.reduce((mx, r) => (r.date > mx ? r.date : mx), reports[0].date)
       : todayStr();
     const curYM = dashYM || ymOf(latest);
-    const monthReports = reports.filter((r) => ymOf(r.date) === curYM);
+    const today = todayStr();
+
+    // ③ 速報は「前日まで」かつ「売上が入力済み」の日報のみを対象にする。
+    //   当日(today)の日報は、新規入力があっても売上が入るまで（＝当日中は）反映しない。
+    //   過去月を表示しているとき(dashYM指定)は前日カットは不要（その月は確定済み）。
+    const monthReports = reports.filter((r) => {
+      if (ymOf(r.date) !== curYM) return false;
+      if (!hasSalesEntered(r)) return false;     // 売上未入力は除外
+      if (!dashYM && r.date >= today) return false; // 当日以降は除外（前日まで）
+      return true;
+    });
     const days = monthReports.length;
 
-    let salesEx = 0, salesInc = 0, guests = 0, partCount = 0, cashGenka = 0, meatTickets = 0;
+    let salesEx = 0, salesInc = 0, guests = 0, partCount = 0, cashGenka = 0;
     const genkaParts = { niku: 0, kome: 0, yasai: 0, chomi: 0, inryo: 0 };
+    // ① 曜日別集計（税込売上・客数）。0=日 .. 6=土
+    const dow = Array.from({ length: 7 }, () => ({ inc: 0, guests: 0, n: 0 }));
     for (const r of monthReports) {
       salesEx += exSalesOf(r);
       salesInc += Number(r.salesInc) || 0;
       guests += Number(r.guests) || 0;
       partCount += Number(r.partCount) || 0;
-      meatTickets += Number(r.meatTickets) || 0;
       for (const [vid, amt] of Object.entries(r.buys || {})) {
         const v = vendorMap[vid] || vendorMap[Number(vid)];
         const val = Number(amt) || 0;
         cashGenka += val;
         if (v && genkaParts[v.cat] != null) genkaParts[v.cat] += val;
       }
+      // 曜日別（売上入力済みの日のみ＝monthReports内なので確定）
+      const dt = new Date(r.date + "T00:00:00");
+      const w = dt.getDay();
+      if (!isNaN(w)) {
+        dow[w].inc += Number(r.salesInc) || 0;
+        dow[w].guests += Number(r.guests) || 0;
+        dow[w].n += 1;
+      }
     }
+    // 曜日別平均（n日で割る）
+    const dowAvg = dow.map((x, i) => ({
+      w: i,
+      avgInc: x.n > 0 ? x.inc / x.n : 0,
+      avgGuests: x.n > 0 ? x.guests / x.n : 0,
+      n: x.n,
+    }));
+
+    // ② 替え肉券は「19日〜翌月18日」を1か月として集計（毎月18日配布）。
+    //   表示対象は curYM を締め月とする期間。売上入力の有無に関わらず枚数は数える
+    //   （ただし前日カットは速報の趣旨に合わせて適用：当日分は除く）。
+    let meatTickets = 0;
+    for (const r of reports) {
+      if (meatPeriodKey(r.date) !== curYM) continue;
+      if (!dashYM && r.date >= today) continue;
+      meatTickets += Number(r.meatTickets) || 0;
+    }
+    // 替え肉券の集計期間の表示用ラベル（19日〜翌18日）
+    const mpY = Number(curYM.slice(0, 4)), mpM = Number(curYM.slice(5, 7));
+    let sY = mpY, sM = mpM - 1;
+    if (sM < 1) { sM = 12; sY -= 1; }
+    const meatPeriodLabel = `${sY}/${String(sM).padStart(2, "0")}/19〜${mpY}/${String(mpM).padStart(2, "0")}/18`;
 
     // 前年同月（取込CSV history を参照）。当月の経過日数ぶんだけ比較するため、
     // 前年同月の「同じ日までの累計」を取る（例: 当月12日まで → 前年も1〜12日）。
@@ -787,6 +855,7 @@ function App() {
       salesInc, salesEx, guests, meatTickets, cashGenka, partCount, partLabor,
       perInc,
       genkaParts,
+      dowAvg, meatPeriodLabel,
       genkaRateActual, laborRate, laborToDate,
       // 目標達成度
       monthTarget, achieveMonth, paceTarget, achievePace,
@@ -1050,7 +1119,7 @@ function Dash({ calc, settings, reports, dashYM, setDashYM }) {
       </div>
 
       <div className="km-row km-stats">
-        <Stat label="替え肉券 当月累計" value={c.meatTickets.toLocaleString() + " 枚"} sub="P/L非反映" />
+        <Stat label="替え肉券 期間累計" value={c.meatTickets.toLocaleString() + " 枚"} sub={c.meatPeriodLabel} />
       </div>
 
       <div className="km-card">
@@ -1079,7 +1148,67 @@ function Dash({ calc, settings, reports, dashYM, setDashYM }) {
           対前年は前年比較タブで取り込んだCSV（前年同月）を参照し、当月の経過日数に揃えて比較します。前年データが無い場合は「—」です。
         </div>
       </div>
+
+      <div className="km-card">
+        <div className="km-cardhead">曜日別平均（{ymLabel}・税込売上／客数）</div>
+        <DowChart dowAvg={c.dowAvg} />
+        <div className="km-note">
+          売上入力済みの日のみで集計した曜日別の1日平均です（前日まで）。棒＝平均税込売上、折れ線＝平均客数。括弧内はその曜日の日数。
+        </div>
+      </div>
     </div>
+  );
+}
+
+// 曜日別平均グラフ（税込売上＝棒、客数＝折れ線）。外部ライブラリ不要のインラインSVG。
+function DowChart({ dowAvg }) {
+  const labels = ["日", "月", "火", "水", "木", "金", "土"];
+  const W = 700, H = 240, padL = 56, padR = 48, padT = 16, padB = 36;
+  const iw = W - padL - padR, ih = H - padT - padB;
+  const maxInc = Math.max(...dowAvg.map((d) => d.avgInc), 1);
+  const maxG = Math.max(...dowAvg.map((d) => d.avgGuests), 1);
+  const bw = iw / 7;
+  const x = (i) => padL + bw * i + bw * 0.18;
+  const barW = bw * 0.64;
+  const yInc = (v) => padT + ih - (v / maxInc) * ih;
+  const yG = (v) => padT + ih - (v / maxG) * ih;
+  const cx = (i) => padL + bw * i + bw * 0.5;
+  const linePts = dowAvg.map((d, i) => `${cx(i)},${yG(d.avgGuests)}`).join(" ");
+  const hasData = dowAvg.some((d) => d.n > 0);
+  if (!hasData) return <div className="km-note">まだ集計できる日報がありません。</div>;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="km-dowchart" style={{ width: "100%", height: "auto" }}>
+      {/* 横グリッド */}
+      {[0.25, 0.5, 0.75, 1].map((f) => (
+        <line key={f} x1={padL} x2={W - padR} y1={padT + ih - f * ih} y2={padT + ih - f * ih}
+          stroke="var(--line)" strokeWidth="1" strokeDasharray="3 3" />
+      ))}
+      {/* 売上の目盛（左） */}
+      {[0, 0.5, 1].map((f) => (
+        <text key={f} x={padL - 8} y={padT + ih - f * ih + 4} textAnchor="end"
+          fontSize="10" fill="var(--dim)">{Math.round((maxInc * f) / 1000)}k</text>
+      ))}
+      {/* 客数の目盛（右） */}
+      {[0, 0.5, 1].map((f) => (
+        <text key={f} x={W - padR + 8} y={padT + ih - f * ih + 4} textAnchor="start"
+          fontSize="10" fill="var(--gold)">{Math.round(maxG * f)}</text>
+      ))}
+      {/* 棒（平均税込売上） */}
+      {dowAvg.map((d, i) => (
+        <g key={i}>
+          <rect x={x(i)} y={yInc(d.avgInc)} width={barW} height={Math.max(0, padT + ih - yInc(d.avgInc))}
+            rx="3" fill="var(--accent)" opacity={d.n > 0 ? 0.85 : 0.2} />
+          <text x={cx(i)} y={H - padB + 18} textAnchor="middle" fontSize="12"
+            fill="var(--ink)" fontWeight="600">{labels[i]}<tspan fontSize="9" fill="var(--dim)" fontWeight="400">({d.n})</tspan></text>
+        </g>
+      ))}
+      {/* 折れ線（平均客数） */}
+      <polyline points={linePts} fill="none" stroke="var(--gold)" strokeWidth="2.5"
+        strokeLinejoin="round" strokeLinecap="round" />
+      {dowAvg.map((d, i) => (
+        <circle key={i} cx={cx(i)} cy={yG(d.avgGuests)} r={d.n > 0 ? 3.5 : 0} fill="var(--gold)" />
+      ))}
+    </svg>
   );
 }
 
@@ -1143,8 +1272,10 @@ function Entry({ form, setForm, addReport, settings, vendors, reports }) {
 
   // 当月(入力中の日付の年月)の替え肉券 累計。入力中の値も加味して表示。
   const ym = ymOf(form.date);
+  // 替え肉券の累計は集計期間（19日〜翌18日）で数える
+  const meatPK = meatPeriodKey(form.date);
   const meatThisMonth = (reports || [])
-    .filter((r) => ymOf(r.date) === ym && r.date !== form.date)
+    .filter((r) => meatPeriodKey(r.date) === meatPK && r.date !== form.date)
     .reduce((s, r) => s + (Number(r.meatTickets) || 0), 0);
   const meatWithToday = meatThisMonth + (Number(form.meatTickets) || 0);
 
@@ -1192,7 +1323,7 @@ function Entry({ form, setForm, addReport, settings, vendors, reports }) {
 
         <div className="km-subhead">替え肉券</div>
         <div className="km-form">
-          <Field label="替え肉券（枚）" hint={`当月累計 ${meatWithToday.toLocaleString()} 枚（P/L非反映）`}>
+          <Field label="替え肉券（枚）" hint={`期間累計（19〜翌18日） ${meatWithToday.toLocaleString()} 枚（P/L非反映）`}>
             <input type="number" placeholder={ph("meatTickets", "枚")} value={form.meatTickets} onChange={set("meatTickets")} />
           </Field>
         </div>
