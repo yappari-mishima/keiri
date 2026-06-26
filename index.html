@@ -1152,6 +1152,23 @@ function Dash({ calc, settings, reports, dashYM, setDashYM }) {
       <div className="km-card">
         <div className="km-cardhead">曜日別平均（{ymLabel}・税込売上／客数）</div>
         <DowChart dowAvg={c.dowAvg} />
+        <div className="km-tablewrap" style={{ marginTop: 10 }}>
+          <table className="km-table">
+            <thead>
+              <tr><th>曜日</th><th className="r">平均税込売上</th><th className="r">平均客数</th><th className="r">日数</th></tr>
+            </thead>
+            <tbody>
+              {c.dowAvg.map((d, i) => (
+                <tr key={i}>
+                  <td className={"km-dow km-dow-" + i} style={{ textAlign: "left" }}>{["日","月","火","水","木","金","土"][i]}</td>
+                  <td className="r mono">{d.n > 0 ? yen(d.avgInc) : "—"}</td>
+                  <td className="r mono">{d.n > 0 ? Math.round(d.avgGuests).toLocaleString() + " 人" : "—"}</td>
+                  <td className="r mono">{d.n}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
         <div className="km-note">
           売上入力済みの日のみで集計した曜日別の1日平均です（前日まで）。棒＝平均税込売上、折れ線＝平均客数。括弧内はその曜日の日数。
         </div>
@@ -1197,7 +1214,14 @@ function DowChart({ dowAvg }) {
       {dowAvg.map((d, i) => (
         <g key={i}>
           <rect x={x(i)} y={yInc(d.avgInc)} width={barW} height={Math.max(0, padT + ih - yInc(d.avgInc))}
-            rx="3" fill="var(--accent)" opacity={d.n > 0 ? 0.85 : 0.2} />
+            rx="3" fill="var(--accent)" opacity={d.n > 0 ? 0.85 : 0.2}>
+            <title>{labels[i]}曜：平均売上 {yen(d.avgInc)} ／ 平均客数 {Math.round(d.avgGuests)}人（{d.n}日）</title>
+          </rect>
+          {/* 棒の上に平均売上 */}
+          {d.n > 0 && (
+            <text x={cx(i)} y={yInc(d.avgInc) - 5} textAnchor="middle" fontSize="10"
+              fill="var(--ink)" fontWeight="600">{Math.round(d.avgInc / 1000)}k</text>
+          )}
           <text x={cx(i)} y={H - padB + 18} textAnchor="middle" fontSize="12"
             fill="var(--ink)" fontWeight="600">{labels[i]}<tspan fontSize="9" fill="var(--dim)" fontWeight="400">({d.n})</tspan></text>
         </g>
@@ -1206,7 +1230,16 @@ function DowChart({ dowAvg }) {
       <polyline points={linePts} fill="none" stroke="var(--gold)" strokeWidth="2.5"
         strokeLinejoin="round" strokeLinecap="round" />
       {dowAvg.map((d, i) => (
-        <circle key={i} cx={cx(i)} cy={yG(d.avgGuests)} r={d.n > 0 ? 3.5 : 0} fill="var(--gold)" />
+        <g key={"g" + i}>
+          <circle cx={cx(i)} cy={yG(d.avgGuests)} r={d.n > 0 ? 3.5 : 0} fill="var(--gold)">
+            <title>{labels[i]}曜：平均客数 {Math.round(d.avgGuests)}人 ／ 平均売上 {yen(d.avgInc)}（{d.n}日）</title>
+          </circle>
+          {/* 客数値 */}
+          {d.n > 0 && (
+            <text x={cx(i)} y={yG(d.avgGuests) - 8} textAnchor="middle" fontSize="9"
+              fill="var(--gold)" fontWeight="600">{Math.round(d.avgGuests)}</text>
+          )}
+        </g>
       ))}
     </svg>
   );
@@ -1468,7 +1501,7 @@ function Log({ reports, setReports, settings, vendorMap }) {
         <div className="km-tablewrap">
           <table className="km-table">
             <thead>
-              <tr><th>日付</th><th className="r">税込売上</th><th className="r">税抜売上</th><th className="r">客数</th><th className="r">客単価</th><th className="r">仕入額</th><th className="r">替え肉券</th><th>天気</th><th>備考</th><th></th></tr>
+              <tr><th>日付</th><th>曜</th><th className="r">税込売上</th><th className="r">税抜売上</th><th className="r">客数</th><th className="r">客単価</th><th className="r">仕入額</th><th className="r">替え肉券</th><th>天気</th><th>備考</th><th></th></tr>
             </thead>
             <tbody>
               {sorted.map((r) => {
@@ -1480,6 +1513,7 @@ function Log({ reports, setReports, settings, vendorMap }) {
                 return (
                   <tr key={r.date}>
                     <td className="mono">{r.date}</td>
+                    <td className={"mono km-dow km-dow-" + new Date(r.date + "T00:00:00").getDay()}>{["日","月","火","水","木","金","土"][new Date(r.date + "T00:00:00").getDay()]}</td>
                     <td className="r mono">{inc > 0 ? yen(inc) : "—"}</td>
                     <td className="r mono">{yen(ex)}</td>
                     <td className="r mono">{g.toLocaleString()}</td>
@@ -1496,6 +1530,7 @@ function Log({ reports, setReports, settings, vendorMap }) {
             <tfoot>
               <tr className="em">
                 <td>{month === "all" ? "全期間 計" : monthLabel(month) + " 計"}</td>
+                <td></td>
                 <td className="r mono">{yen(tot.inc)}</td>
                 <td className="r mono">{yen(tot.ex)}</td>
                 <td className="r mono">{tot.g.toLocaleString()}</td>
@@ -1889,11 +1924,32 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
   );
   const catName = Object.fromEntries(GENKA_CATS);
 
+  // ③ 肉仕入は「1〜15日締め」「16〜末日締め」の2回に分かれて請求が来る。
+  //   業者別に各期間の納品書合計を出す（前半=日付の日が1〜15、後半=16以降）。
+  const vendorBuysByPeriod = useMemo(() => {
+    const out = {}; // { vendorId: { first, second } }
+    const mr = reports.filter((r) => ymOf(r.date) === ym);
+    for (const r of mr) {
+      const d = Number((r.date || "").slice(8, 10));
+      const half = d <= 15 ? "first" : "second";
+      for (const [vid, amt] of Object.entries(r.buys || {})) {
+        const v = (out[vid] = out[vid] || { first: 0, second: 0 });
+        v[half] += Number(amt) || 0;
+      }
+    }
+    return out;
+  }, [reports, ym]);
+
   // 業者別請求から原価区分集計 → J19〜J23 の確定値ソース
   const invGenka = useMemo(
     () => genkaFromInvoices(agg, genkaVendors, invoices),
     [agg, genkaVendors, invoices]
   );
+  // 原価の総合計（全区分の確定値合計）
+  const genkaGrandTotal = ["niku", "kome", "yasai", "chomi", "inryo"]
+    .reduce((a, cat) => a + (invGenka[cat] || 0), 0);
+  const notedGrandTotal = genkaVendors
+    .reduce((a, v) => a + (agg.vendorBuys[String(v.id)] || 0), 0);
   // J19〜J23は業者別請求の集計を「確定値」とみなす（cellのcur入力より優先）
   const genkaCellMap = { J19: "niku", J20: "kome", J21: "yasai", J22: "chomi", J23: "inryo" };
   const isGenkaCell = (cell) => genkaCellMap[cell] != null;
@@ -2086,6 +2142,8 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                 <tr>
                   <th>業者</th>
                   <th>区分</th>
+                  <th className="r">前半<br/>1〜15日</th>
+                  <th className="r">後半<br/>16〜末</th>
                   <th className="r">納品書合計（日報）</th>
                   <th className="r">請求額（月締め）</th>
                   <th className="r">差異</th>
@@ -2100,6 +2158,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                       {vs.map((v) => {
                         const id = String(v.id);
                         const noted = agg.vendorBuys[id] || 0;
+                        const per = vendorBuysByPeriod[id] || { first: 0, second: 0 };
                         const billedRaw = invoices[id];
                         const hasBill = billedRaw != null && billedRaw !== "";
                         const billed = hasBill ? (Number(billedRaw) || 0) : null;
@@ -2108,6 +2167,8 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                           <tr key={id}>
                             <td>{v.name}</td>
                             <td>{catName[v.cat]}</td>
+                            <td className="r mono dim">{per.first ? yen(per.first) : "—"}</td>
+                            <td className="r mono dim">{per.second ? yen(per.second) : "—"}</td>
                             <td className="r mono">{yen(noted)}</td>
                             <td className="r">
                               <input
@@ -2134,15 +2195,27 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                   if (!vs.length) return null;
                   const notedSum = vs.reduce((a, v) => a + (agg.vendorBuys[String(v.id)] || 0), 0);
                   const confSum = invGenka[cat] || 0;
+                  const firstSum = vs.reduce((a, v) => a + ((vendorBuysByPeriod[String(v.id)] || {}).first || 0), 0);
+                  const secondSum = vs.reduce((a, v) => a + ((vendorBuysByPeriod[String(v.id)] || {}).second || 0), 0);
                   return (
                     <tr className="em" key={"f" + cat}>
                       <td colSpan={2}>{catName[cat]} 計 → 原価確定</td>
+                      <td className="r mono dim">{firstSum ? yen(firstSum) : "—"}</td>
+                      <td className="r mono dim">{secondSum ? yen(secondSum) : "—"}</td>
                       <td className="r mono">{yen(notedSum)}</td>
                       <td className="r mono">{yen(confSum)}</td>
                       <td className="r mono">{confSum - notedSum === 0 ? "0" : (confSum - notedSum > 0 ? "+" : "") + yen(confSum - notedSum)}</td>
                     </tr>
                   );
                 })}
+                <tr className="em km-grandtotal">
+                  <td colSpan={2}>原価 総合計（J19〜J23）</td>
+                  <td className="r mono dim"></td>
+                  <td className="r mono dim"></td>
+                  <td className="r mono">{yen(notedGrandTotal)}</td>
+                  <td className="r mono">{yen(genkaGrandTotal)}</td>
+                  <td className="r mono">{genkaGrandTotal - notedGrandTotal === 0 ? "0" : (genkaGrandTotal - notedGrandTotal > 0 ? "+" : "") + yen(genkaGrandTotal - notedGrandTotal)}</td>
+                </tr>
               </tfoot>
             </table>
           </div>
@@ -2875,6 +2948,10 @@ const CSS = `
 .km-numin{width:120px;border:1px solid var(--line);border-radius:7px;padding:6px 8px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums}
 .km-numin:focus{outline:none;border-color:var(--accent)}
 .km-cellref{font-size:10px;color:var(--dim);background:var(--accent-soft);padding:1px 5px;border-radius:5px;margin-left:6px;font-variant-numeric:tabular-nums}
+.km-dow{text-align:center;font-weight:600}
+.km-dow-0{color:#c0392b}/* 日 */
+.km-dow-6{color:#2563eb}/* 土 */
+.km-grandtotal td{border-top:2px solid var(--accent);font-weight:700}
 .dim{color:var(--dim)}.pos{color:var(--accent)}.neg{color:var(--neg)}
 .km-note{font-size:11px;color:var(--dim);margin-top:12px;line-height:1.5}
 .km-total{margin-top:10px;font-size:14px;color:#444}
