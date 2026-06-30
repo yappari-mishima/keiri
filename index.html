@@ -741,15 +741,13 @@ function App() {
       ? reports.reduce((mx, r) => (r.date > mx ? r.date : mx), reports[0].date)
       : todayStr();
     const curYM = dashYM || ymOf(latest);
-    const today = todayStr();
 
-    // ③ 速報は「前日まで」かつ「売上が入力済み」の日報のみを対象にする。
-    //   当日(today)の日報は、新規入力があっても売上が入るまで（＝当日中は）反映しない。
-    //   過去月を表示しているとき(dashYM指定)は前日カットは不要（その月は確定済み）。
+    // ③ 速報は「税込売上が入力済み」の日報のみを対象にする。
+    //   売上を入力した日報がそのまま反映される（日付の前日判定は行わない）。
+    //   売上未入力の日報（客数や替え肉券だけ等）は反映しない。
     const monthReports = reports.filter((r) => {
       if (ymOf(r.date) !== curYM) return false;
       if (!hasSalesEntered(r)) return false;     // 売上未入力は除外
-      if (!dashYM && r.date >= today) return false; // 当日以降は除外（前日まで）
       return true;
     });
     const days = monthReports.length;
@@ -787,12 +785,10 @@ function App() {
     }));
 
     // ② 替え肉券は「19日〜翌月18日」を1か月として集計（毎月18日配布）。
-    //   表示対象は curYM を締め月とする期間。売上入力の有無に関わらず枚数は数える
-    //   （ただし前日カットは速報の趣旨に合わせて適用：当日分は除く）。
+    //   表示対象は curYM を締め月とする期間。枚数は売上入力の有無に関わらず数える。
     let meatTickets = 0;
     for (const r of reports) {
       if (meatPeriodKey(r.date) !== curYM) continue;
-      if (!dashYM && r.date >= today) continue;
       meatTickets += Number(r.meatTickets) || 0;
     }
     // 替え肉券の集計期間の表示用ラベル（19日〜翌18日）
@@ -1439,6 +1435,8 @@ function Vendors({ vendors, setVendors }) {
   };
   const setVCat = (id) => (e) =>
     setVendors((p) => p.map((v) => (v.id === id ? { ...v, cat: e.target.value } : v)));
+  const setVName = (id) => (e) =>
+    setVendors((p) => p.map((v) => (v.id === id ? { ...v, name: e.target.value } : v)));
   const del = (id) => setVendors((p) => p.filter((v) => v.id !== id));
   return (
     <div className="km-page">
@@ -1459,7 +1457,7 @@ function Vendors({ vendors, setVendors }) {
         <div className="km-vlist">
           {vendors.map((v) => (
             <div className="km-vrow" key={v.id}>
-              <span className="km-vname-static">{v.name}</span>
+              <input className="km-vname-edit" value={v.name} onChange={setVName(v.id)} placeholder="業者名" />
               <select value={v.cat} onChange={setVCat(v.id)}>
                 {GENKA_CATS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
               </select>
@@ -2975,8 +2973,10 @@ const CSS = `
 .km-loadbtn:hover{background:var(--gold);color:#fff}
 .km-vrow{display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)}
 .km-vadd{border-bottom:2px solid var(--line);padding-bottom:14px;margin-bottom:6px}
-.km-vname,.km-vname-static{flex:1}
-.km-vname{padding:9px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;font-family:inherit;background:#fdfdfb}
+.km-vname,.km-vname-static,.km-vname-edit{flex:1}
+.km-vname,.km-vname-edit{padding:9px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;font-family:inherit;background:#fdfdfb}
+.km-vname-edit{font-weight:600}
+.km-vname-edit:focus{outline:none;border-color:var(--accent);background:#fff}
 .km-vname-static{font-size:14px;font-weight:600}
 .km-vrow select{padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px;font-family:inherit;background:#fdfdfb}
 .km-add{border:0;background:var(--accent);color:#fff;padding:9px 16px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;font-family:inherit}
