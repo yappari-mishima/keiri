@@ -72,6 +72,11 @@
   /* table */
   .tbl-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px}
   table{border-collapse:collapse;width:100%;font-size:13px;min-width:760px}
+  /* 横スクロールなしで収める小型テーブル（確認書タブの金種実査・立替金） */
+  .fit-wrap{overflow-x:visible;border:1px solid var(--line);border-radius:10px}
+  .fit-wrap table{min-width:0;width:100%;table-layout:fixed}
+  .fit-wrap th,.fit-wrap td{padding:7px 8px}
+  .fit-wrap input{width:100%!important}
   th{background:#efe9dc;color:var(--ink-soft);font-weight:700;font-size:11px;letter-spacing:.04em;padding:9px 10px;text-align:left;border-bottom:1px solid var(--line-strong);white-space:nowrap}
   td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
   tr:last-child td{border-bottom:none}
@@ -866,6 +871,61 @@ function Ledger({
 
   // 未精算の立替合計（FIFO残＝outstanding を合計。部分精算も正しく反映）
   const pendingTotal = useMemo(() => comp.rows.filter(r => r.kind === '現金支出' && !r.settled).reduce((s, r) => s + (+r.outstanding || 0), 0), [comp.rows]);
+
+  // チェックボックス選択（対象＝立替中の現金支出のみ）
+  const [sel, setSel] = useState({}); // {id:true}
+  const selectableIds = useMemo(() => new Set(comp.rows.filter(r => r.kind === '現金支出' && !r.settled).map(r => r.id)), [comp.rows]);
+  // 表示中かつ選択可能な行のうちチェック済みのもの
+  const checkedRows = useMemo(() => shownRows.filter(r => sel[r.id] && selectableIds.has(r.id)), [shownRows, sel, selectableIds]);
+  const checkedTotal = checkedRows.reduce((s, r) => s + (+r.outstanding || +r.out || 0), 0);
+  const toggleSel = id => setSel(p => ({
+    ...p,
+    [id]: !p[id]
+  }));
+  // 表示中の選択可能行を全部チェック/解除
+  const shownSelectable = shownRows.filter(r => selectableIds.has(r.id));
+  const allChecked = shownSelectable.length > 0 && shownSelectable.every(r => sel[r.id]);
+  function toggleAll() {
+    if (allChecked) {
+      const n = {
+        ...sel
+      };
+      shownSelectable.forEach(r => delete n[r.id]);
+      setSel(n);
+    } else {
+      const n = {
+        ...sel
+      };
+      shownSelectable.forEach(r => n[r.id] = true);
+      setSel(n);
+    }
+  }
+  // 選択した立替をまとめて1行の「レシート本社送付」にする
+  function bulkSend() {
+    if (checkedRows.length === 0) {
+      showToast('立替中の明細を選択してください');
+      return;
+    }
+    const total = checkedRows.reduce((s, r) => s + (+r.outstanding || +r.out || 0), 0);
+    // 内容：選んだ明細の内容をまとめる（重複は1つに。複数種類なら「○○ ほか」）
+    const names = [...new Set(checkedRows.map(r => (r.desc || '').trim()).filter(Boolean))];
+    let desc = names.length === 0 ? 'レシート本社送付' : names.length === 1 ? names[0] : names[0] + ' ほか';
+    if (!confirm('選択した立替 ' + checkedRows.length + '件（合計 ' + yen(total) + '）を\n1件の「レシート本社送付」にまとめます。\n内容：' + desc + '\nよろしいですか？')) return;
+    const entry = {
+      id: uid(),
+      date: todayISO(),
+      kind: 'レシート本社送付',
+      desc,
+      out: 0,
+      inc: 0,
+      receiptDelta: -total,
+      hqDelta: total,
+      note: 'まとめ送付 ' + checkedRows.length + '件（' + yen(total) + '）'
+    };
+    setLedger([...ledger, entry]);
+    setSel({});
+    showToast(yen(total) + ' を本社送付にまとめました');
+  }
   const hasOpening = ledger.some(r => r.kind === '開始残高');
   function addOpening() {
     const v = settings.koguchi || 0;
@@ -912,15 +972,16 @@ function Ledger({
     }
     let out = f.out,
       inc = f.inc;
-    // 送付は支出額欄に送付額を入れてもらう運用 → out として扱う
     const d = deriveDeltas(f.kind, out, inc);
+    // レシート本社送付は現金残高を動かさない（手元レシート→本社未入金の振替のみ）
+    const isSend = f.kind === 'レシート本社送付';
     const entry = {
       id: editId || uid(),
       date: f.date,
       kind: f.kind,
       desc: f.desc,
-      out: +out || 0,
-      inc: +inc || 0,
+      out: isSend ? 0 : +out || 0,
+      inc: isSend ? 0 : +inc || 0,
       ...d,
       note: f.note
     };
@@ -1148,8 +1209,50 @@ function Ledger({
   }, "未精算の立替合計（本社へ請求中）"), /*#__PURE__*/React.createElement("div", {
     className: "v"
   }, yen(pendingTotal))), /*#__PURE__*/React.createElement("div", {
+    className: "bulk-bar no-print",
+    style: {
+      display: 'flex',
+      alignItems: 'center',
+      gap: 12,
+      flexWrap: 'wrap',
+      padding: '10px 12px',
+      marginBottom: 10,
+      borderRadius: 10,
+      background: checkedRows.length ? 'var(--amber-bg)' : 'var(--paper)',
+      border: '1px solid ' + (checkedRows.length ? 'var(--amber)' : 'var(--line-strong)')
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 13,
+      fontWeight: 700,
+      color: 'var(--ink-soft)'
+    }
+  }, checkedRows.length > 0 ? `選択中：${checkedRows.length}件 / 合計 ${yen(checkedTotal)}` : 'チェックした立替をまとめて本社送付にできます'), /*#__PURE__*/React.createElement("button", {
+    className: "btn sm",
+    disabled: checkedRows.length === 0,
+    style: checkedRows.length === 0 ? {
+      opacity: .45,
+      cursor: 'default'
+    } : {},
+    onClick: bulkSend
+  }, "選択をまとめてレシート本社送付"), checkedRows.length > 0 && /*#__PURE__*/React.createElement("button", {
+    className: "btn ghost sm",
+    onClick: () => setSel({})
+  }, "選択解除")), /*#__PURE__*/React.createElement("div", {
     className: "tbl-wrap"
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "日付"), /*#__PURE__*/React.createElement("th", null, "区分"), /*#__PURE__*/React.createElement("th", null, "内容"), /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", {
+    className: "no-print",
+    style: {
+      width: 34,
+      textAlign: 'center'
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: allChecked,
+    onChange: toggleAll,
+    disabled: shownSelectable.length === 0,
+    title: "表示中の立替を全選択"
+  })), /*#__PURE__*/React.createElement("th", null, "日付"), /*#__PURE__*/React.createElement("th", null, "区分"), /*#__PURE__*/React.createElement("th", null, "内容"), /*#__PURE__*/React.createElement("th", {
     className: "num"
   }, "支出"), /*#__PURE__*/React.createElement("th", {
     className: "num"
@@ -1162,13 +1265,15 @@ function Ledger({
   }, "本社未入金"), /*#__PURE__*/React.createElement("th", null, "状態"), /*#__PURE__*/React.createElement("th", null, "備考"), /*#__PURE__*/React.createElement("th", {
     className: "no-print"
   }))), /*#__PURE__*/React.createElement("tbody", null, shownRows.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: 11,
+    colSpan: 12,
     className: "empty"
   }, view === 'pending' ? '未精算の立替はありません。' : 'この条件の取引はありません。')), view === 'month' && carryBefore && asc && /*#__PURE__*/React.createElement("tr", {
     style: {
       background: '#efe9dc'
     }
   }, /*#__PURE__*/React.createElement("td", {
+    className: "no-print"
+  }), /*#__PURE__*/React.createElement("td", {
     className: "muted",
     colSpan: 5,
     style: {
@@ -1182,49 +1287,71 @@ function Ledger({
     className: "num"
   }, num(carryBefore.hqBal)), /*#__PURE__*/React.createElement("td", {
     colSpan: 3
-  })), shownRows.map(r => /*#__PURE__*/React.createElement("tr", {
-    key: r.id
-  }, /*#__PURE__*/React.createElement("td", {
-    className: "muted",
-    style: {
-      whiteSpace: 'nowrap'
-    }
-  }, r.date), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
-    className: 'kind-pill ' + (KINDS[r.kind]?.cls || '')
-  }, r.kind)), /*#__PURE__*/React.createElement("td", null, r.desc), /*#__PURE__*/React.createElement("td", {
-    className: "num"
-  }, r.out ? num(r.out) : '—'), /*#__PURE__*/React.createElement("td", {
-    className: "num"
-  }, r.inc ? num(r.inc) : '—'), /*#__PURE__*/React.createElement("td", {
-    className: "num"
-  }, num(r.cashBal)), /*#__PURE__*/React.createElement("td", {
-    className: "num"
-  }, num(r.recBal)), /*#__PURE__*/React.createElement("td", {
-    className: "num"
-  }, num(r.hqBal)), /*#__PURE__*/React.createElement("td", null, r.kind === '現金支出' ? r.settled ? /*#__PURE__*/React.createElement("span", {
-    className: "kind-pill k-settle"
-  }, "精算済") : /*#__PURE__*/React.createElement("span", {
-    className: "kind-pill k-send"
-  }, "立替中", r.outstanding && r.outstanding !== (+r.out || 0) ? '（残' + num(r.outstanding) + '）' : '') : /*#__PURE__*/React.createElement("span", {
-    className: "muted"
-  }, "—")), /*#__PURE__*/React.createElement("td", {
-    className: "muted"
-  }, r.note), /*#__PURE__*/React.createElement("td", {
-    className: "no-print",
-    style: {
-      whiteSpace: 'nowrap'
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    className: "btn ghost sm",
-    onClick: () => edit(r)
-  }, "編集"), ' ', /*#__PURE__*/React.createElement("button", {
-    className: "btn danger sm",
-    onClick: () => del(r.id)
-  }, "削除")))), view === 'month' && carryBefore && !asc && /*#__PURE__*/React.createElement("tr", {
+  })), shownRows.map(r => {
+    const canCheck = selectableIds.has(r.id);
+    return /*#__PURE__*/React.createElement("tr", {
+      key: r.id,
+      style: sel[r.id] && canCheck ? {
+        background: 'var(--amber-bg)'
+      } : undefined
+    }, /*#__PURE__*/React.createElement("td", {
+      className: "no-print",
+      style: {
+        textAlign: 'center'
+      }
+    }, canCheck ? /*#__PURE__*/React.createElement("input", {
+      type: "checkbox",
+      checked: !!sel[r.id],
+      onChange: () => toggleSel(r.id)
+    }) : /*#__PURE__*/React.createElement("span", {
+      className: "muted",
+      style: {
+        fontSize: 11
+      }
+    }, "—")), /*#__PURE__*/React.createElement("td", {
+      className: "muted",
+      style: {
+        whiteSpace: 'nowrap'
+      }
+    }, r.date), /*#__PURE__*/React.createElement("td", null, /*#__PURE__*/React.createElement("span", {
+      className: 'kind-pill ' + (KINDS[r.kind]?.cls || '')
+    }, r.kind)), /*#__PURE__*/React.createElement("td", null, r.desc), /*#__PURE__*/React.createElement("td", {
+      className: "num"
+    }, r.out ? num(r.out) : '—'), /*#__PURE__*/React.createElement("td", {
+      className: "num"
+    }, r.inc ? num(r.inc) : '—'), /*#__PURE__*/React.createElement("td", {
+      className: "num"
+    }, num(r.cashBal)), /*#__PURE__*/React.createElement("td", {
+      className: "num"
+    }, num(r.recBal)), /*#__PURE__*/React.createElement("td", {
+      className: "num"
+    }, num(r.hqBal)), /*#__PURE__*/React.createElement("td", null, r.kind === '現金支出' ? r.settled ? /*#__PURE__*/React.createElement("span", {
+      className: "kind-pill k-settle"
+    }, "精算済") : /*#__PURE__*/React.createElement("span", {
+      className: "kind-pill k-send"
+    }, "立替中", r.outstanding && r.outstanding !== (+r.out || 0) ? '（残' + num(r.outstanding) + '）' : '') : /*#__PURE__*/React.createElement("span", {
+      className: "muted"
+    }, "—")), /*#__PURE__*/React.createElement("td", {
+      className: "muted"
+    }, r.note), /*#__PURE__*/React.createElement("td", {
+      className: "no-print",
+      style: {
+        whiteSpace: 'nowrap'
+      }
+    }, /*#__PURE__*/React.createElement("button", {
+      className: "btn ghost sm",
+      onClick: () => edit(r)
+    }, "編集"), ' ', /*#__PURE__*/React.createElement("button", {
+      className: "btn danger sm",
+      onClick: () => del(r.id)
+    }, "削除")));
+  }), view === 'month' && carryBefore && !asc && /*#__PURE__*/React.createElement("tr", {
     style: {
       background: '#efe9dc'
     }
   }, /*#__PURE__*/React.createElement("td", {
+    className: "no-print"
+  }), /*#__PURE__*/React.createElement("td", {
     className: "muted",
     colSpan: 5,
     style: {
@@ -1641,27 +1768,50 @@ function Confirm({
       color: 'var(--ink-soft)'
     }
   }, "レジ内現金 金種別実査（予備金＋食券機の枚数を入力 → 自動合算）"), /*#__PURE__*/React.createElement("div", {
-    className: "tbl-wrap",
+    className: "fit-wrap",
     style: {
-      maxWidth: 520
+      maxWidth: 560
     }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "金種"), /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("colgroup", null, /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: '18%'
+    }
+  }), /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: '22%'
+    }
+  }), /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: '22%'
+    }
+  }), /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: '18%'
+    }
+  }), /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: '20%'
+    }
+  })), /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "金種"), /*#__PURE__*/React.createElement("th", {
     className: "num"
   }, "予備金"), /*#__PURE__*/React.createElement("th", {
     className: "num"
   }, "食券機"), /*#__PURE__*/React.createElement("th", {
     className: "num"
-  }, "合計枚数"), /*#__PURE__*/React.createElement("th", {
+  }, "合計"), /*#__PURE__*/React.createElement("th", {
     className: "num"
   }, "金額"))), /*#__PURE__*/React.createElement("tbody", null, DENOMS.map(d => /*#__PURE__*/React.createElement("tr", {
     key: d
-  }, /*#__PURE__*/React.createElement("td", null, num(d), "円"), /*#__PURE__*/React.createElement("td", {
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      whiteSpace: 'nowrap'
+    }
+  }, num(d), "円"), /*#__PURE__*/React.createElement("td", {
     className: "num"
   }, /*#__PURE__*/React.createElement("input", {
     type: "number",
     min: "0",
     style: {
-      width: 64,
       padding: '4px 6px'
     },
     value: cur.yobi[d] ?? '',
@@ -1677,7 +1827,6 @@ function Confirm({
     type: "number",
     min: "0",
     style: {
-      width: 64,
       padding: '4px 6px'
     },
     value: cur.shoku[d] ?? '',
@@ -1699,15 +1848,29 @@ function Confirm({
       color: 'var(--ink-soft)'
     }
   }, "立替金（出納帳から自動集計・3欄／同一項目はまとめ／超過分はその他）"), /*#__PURE__*/React.createElement("div", {
-    className: "tbl-wrap",
+    className: "fit-wrap",
     style: {
       maxWidth: 420
     }
-  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "内容"), /*#__PURE__*/React.createElement("th", {
+  }, /*#__PURE__*/React.createElement("table", null, /*#__PURE__*/React.createElement("colgroup", null, /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: '68%'
+    }
+  }), /*#__PURE__*/React.createElement("col", {
+    style: {
+      width: '32%'
+    }
+  })), /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("th", null, "内容"), /*#__PURE__*/React.createElement("th", {
     className: "num"
   }, "金額"))), /*#__PURE__*/React.createElement("tbody", null, rireokaeRows.map((r, i) => /*#__PURE__*/React.createElement("tr", {
     key: i
-  }, /*#__PURE__*/React.createElement("td", null, r.name || /*#__PURE__*/React.createElement("span", {
+  }, /*#__PURE__*/React.createElement("td", {
+    style: {
+      whiteSpace: 'nowrap',
+      overflow: 'hidden',
+      textOverflow: 'ellipsis'
+    }
+  }, r.name || /*#__PURE__*/React.createElement("span", {
     className: "muted"
   }, "（なし）")), /*#__PURE__*/React.createElement("td", {
     className: "num"
