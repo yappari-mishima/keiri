@@ -160,6 +160,7 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
     J25:'53', J26:'53',
     J30:'88', J31:'88', J32:'88', J33:'88', J34:'88', J35:'88',
     J36:'88', J37:'88', J38:'88', J39:'88', J40:'88',
+    J41:'129',
     J47:'55',
     P4:'47', J11:'51', K11:'121'
   };
@@ -300,57 +301,65 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
         rows[ri][cidx] = val;
       }
 
-      // 三島店ヘッダ列を探す
-      var jcol = -1, hdrRow = -1;
-      for (var r = 0; r < Math.min(rows.length, 10); r++) {
-        if (!rows[r]) continue;
-        for (var c = 0; c < rows[r].length; c++) {
-          if (typeof rows[r][c] === 'string' && rows[r][c].indexOf(STORE) >= 0) { jcol = c; hdrRow = r; }
-        }
+      // === LD課 収支表フォーマット：三島店は AW列固定・行は固定位置 ===
+      // 列インデックス（0始まり）: AW = 48
+      function colToIdxLocal(col) {
+        var n = 0;
+        for (var i = 0; i < col.length; i++) n = n * 26 + (col.charCodeAt(i) - 64);
+        return n - 1;
       }
-      if (jcol < 0) return { ok: false, error: STORE + ' の列が見つかりませんでした' };
+      var jisseki = colToIdxLocal('AW'); // 三島店の実績列（固定）
 
-      // 実績サブ列（ヘッダ次行で '実績'）
-      var subRow = hdrRow + 1, jisseki = jcol;
-      if (rows[subRow]) {
-        for (var cc = jcol; cc < jcol + 6; cc++) {
-          if (norm(rows[subRow][cc]) === '実績') { jisseki = cc; break; }
-        }
+      // AW4（結合セル）に店名が入っていれば三島であることを確認。無ければAW列既定で続行。
+      var hdrName = rows[3] ? rows[3][jisseki] : null; // 4行目 = index 3
+      var storeLabel = (typeof hdrName === 'string' && hdrName.replace(/\s/g, '')) ? hdrName : STORE;
+
+      // 行位置（0始まり）で値(千円)を取得。毎月同じ位置である前提。
+      function rowVal(rowNo1) { // rowNo1 = 1始まりの行番号
+        var rr = rows[rowNo1 - 1];
+        return rr ? numOf(rr[jisseki]) : 0;
+      }
+      function yenOf(rowNo1) { // 千円 → 円
+        return Math.round(rowVal(rowNo1) * 1000);
       }
 
-      var L = makeLookup(rows, jisseki);
-      var k1 = function (label) { var v = L(label); return v == null ? null : Math.round(v * 1000); };
-
-      // --- FCマッピング（確定済み） ---
-      var uriage = k1('総売上高');
-      var kyuyo = k1('給与');           // 給与･手当 → J30 社員
-      var baito = k1('アルバイト');     // → J31 パート
-      var fukuri = k1('福利厚生費');    // → J32 法定福利
-      var suikou = k1('水道光熱費');    // → J33
-      var shomo = k1('消耗品費');       // → J37
-      var koukoku = k1('広告宣伝費');   // → J38
-      // その他(J40) = 通信+保険料+車両費+雑費その他
-      var tsushin = L('通信費'), hoken = L('保険料'), sharyo = L('車両費'), zappi = L('雑費');
-      var sonota = [tsushin, hoken, sharyo, zappi].reduce(function (a, b) { return a + (b == null ? 0 : b); }, 0);
-      var sonotaYen = Math.round(sonota * 1000);
+      // --- 会社PL 固定行マップ（LD課フォーマット・千円） ---
+      // r11 給与 / r12 福利厚生 / r13 アルバイト
+      // r15 施設費計 / r16 広告 / r19 水光熱 / r21 消耗品
+      // r28 その他経費計 = SUM(AW16:AW27)（広告・水光熱・消耗品・通信・保険・車両・雑費等を含む）
+      var uriage  = yenOf(9);   // r9 総売上高（想定行）
+      var kyuyo   = yenOf(11);  // r11 給与 → J30 社員
+      var fukuri  = yenOf(12);  // r12 福利厚生 → J32 法定福利
+      var baito   = yenOf(13);  // r13 アルバイト → J31 パート
+      var shisetsu = yenOf(15); // r15 施設費計（AW15）→ J35算出に使用
+      var koukoku = yenOf(16);  // r16 広告 → J38
+      var suikou  = yenOf(19);  // r19 水光熱 → J33
+      var shomo   = yenOf(21);  // r21 消耗品 → J37
+      var sonotaKei = yenOf(28); // r28 その他経費計（AW28）→ J40算出に使用
 
       var items = [
-        { cell: 'J16', label: '売上高（税抜）', yen: uriage, src: '総売上高' },
-        { cell: 'J30', label: '人件費（社員）', yen: kyuyo, src: '給与･手当' },
-        { cell: 'J31', label: '人件費（パート）', yen: baito, src: 'アルバイト' },
-        { cell: 'J32', label: '法定福利', yen: fukuri, src: '福利厚生費' },
-        { cell: 'J33', label: '水道光熱費', yen: suikou, src: '水道光熱費' },
-        { cell: 'J37', label: '消耗品費', yen: shomo, src: '消耗品費' },
-        { cell: 'J38', label: '広告宣伝費', yen: koukoku, src: '広告宣伝費' },
-        { cell: 'J40', label: 'その他', yen: sonotaYen, src: '通信+保険+車両+雑費' },
+        { cell: 'J16', label: '売上高（税抜）', yen: uriage, src: 'AW9 総売上高' },
+        { cell: 'J30', label: '人件費（社員）', yen: kyuyo, src: 'AW11 給与' },
+        { cell: 'J31', label: '人件費（パート）', yen: baito, src: 'AW13 アルバイト' },
+        { cell: 'J32', label: '法定福利', yen: fukuri, src: 'AW12 福利厚生' },
+        { cell: 'J33', label: '水道光熱費', yen: suikou, src: 'AW19 水光熱' },
+        { cell: 'J37', label: '消耗品費', yen: shomo, src: 'AW21 消耗品' },
+        { cell: 'J38', label: '広告宣伝費', yen: koukoku, src: 'AW16 広告' },
       ].filter(function (it) { return it.yen != null; });
+
+      // 施設費計・その他経費計は、家賃/ロイヤリティ確定後にJ35/J40を逆算するため raw で返す
+      var raw = {
+        shisetsuKei: shisetsu,   // AW15 施設費計（円）
+        sonotaKei: sonotaKei,    // AW28 その他経費計（円）
+      };
 
       // 参考表示（FCに自動反映しない）
       var info = [
-        { label: '施設費計', yen: k1('施設費計') },
-        { label: '本社費', yen: L('本社費') == null ? null : Math.round(L('本社費') * 1000) },
-        { label: '営業利益（会社PL）', yen: k1('営業利益') },
-        { label: '粗利合計（会社PL）', yen: k1('粗利合計') },
+        { label: '施設費計(AW15)', yen: shisetsu },
+        { label: 'その他経費計(AW28)', yen: sonotaKei },
+        { label: '本社費(AW33)', yen: yenOf(33) },
+        { label: '営業利益(AW35)', yen: yenOf(35) },
+        { label: '経常利益(AW37)', yen: yenOf(37) },
       ].filter(function (it) { return it.yen != null; });
 
       // 対象月（タイトル行 or シート名から推定）
@@ -365,7 +374,7 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
       var ymM = /(\d{4})\s*年\s*(\d{1,2})\s*月/.exec(scanText);
       if (ymM) ym = ymM[1] + '-' + ('0' + ymM[2]).slice(-2);
 
-      return { ok: true, ym: ym, store: STORE, items: items, info: info };
+      return { ok: true, ym: ym, store: storeLabel, items: items, info: info, raw: raw };
     } catch (e) {
       return { ok: false, error: (e && e.message) ? e.message : String(e) };
     }
@@ -422,6 +431,7 @@ const DEFAULT_SETTINGS = {
   depreciation: 0,        // 減価償却費
   loanRepay: 0,           // 借入元金返済
   royaltyRate: 0.05,      // ロイヤリティ率
+  royaltyFixed: 0,        // ロイヤリティ確定額(DS請求書・税抜・円)。会社PL取込時のJ36に使用
   fixedLabor: 0,          // 社員給与(固定)
   partRate: 7500,         // アルバイト1人当たり日額(概算・円)
   // 想定原価率 (空なら標準率を使用)
@@ -590,6 +600,15 @@ function normDate(s) {
 
 const ymOf = (d) => (d || "").slice(0, 7);   // "2026-06"
 const yOf = (d) => (d || "").slice(0, 4);    // "2026"
+// "YYYY-MM" に n ヶ月加算した "YYYY-MM" を返す（棚卸の翌月繰越などに使用）
+const ymPlus = (ym, n) => {
+  const m = /^(\d{4})-(\d{2})$/.exec(ym || "");
+  if (!m) return ym;
+  const base = (parseInt(m[1], 10) * 12 + (parseInt(m[2], 10) - 1)) + (Number(n) || 0);
+  const y = Math.floor(base / 12);
+  const mo = (base % 12) + 1;
+  return y + "-" + ("0" + mo).slice(-2);
+};
 const WEEKDAY_JP = ["日", "月", "火", "水", "木", "金", "土"];
 
 // ---- 天気 (Open-Meteo 無料API・キー不要) ----
@@ -1885,6 +1904,7 @@ function buildPLItems(agg, settings) {
     { cell: "J38", label: "広告宣伝費", group: "販管費", est: null },
     { cell: "J39", label: "衛生費", group: "販管費", est: null },
     { cell: "J40", label: "その他", group: "販管費", est: null },
+    { cell: "J41", label: "概算消費税", group: "販管費", est: null },
     { cell: "J47", label: "借入元金返済", group: "CF", est: Number(s.loanRepay) || null },
   ];
 }
@@ -1913,7 +1933,19 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
 
   const cur = confirms[ym] || {};
   const setCell = (cell, val) =>
-    setConfirms((p) => ({ ...p, [ym]: { ...(p[ym] || {}), [cell]: val } }));
+    setConfirms((p) => {
+      const result = { ...p, [ym]: { ...(p[ym] || {}), [cell]: val } };
+      // 月末棚卸(J26)を入力したら、翌月の月初棚卸(J25)へ自動繰越（翌月J25が空のときのみ）
+      if (cell === "J26" && val != null && val !== "") {
+        const nextYM = ymPlus(ym, 1);
+        const nm = { ...(result[nextYM] || {}) };
+        if (nm.J25 == null || nm.J25 === "") {
+          nm.J25 = Number(val) || 0;
+          result[nextYM] = nm;
+        }
+      }
+      return result;
+    });
 
   // ---- 業者別 請求額（月締め確定）----
   const invoices = cur._invoices || {};
@@ -2016,11 +2048,62 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
     if (!plPreview) return;
     const targetYM = plPreview.ym || ym;
     setConfirms((p) => {
-      const next = { ...(p[targetYM] || {}) };
+      // 既存の確定値（棚卸J25/J26など）は必ず保持したままマージ
+      const prev = p[targetYM] || {};
+      const next = { ...prev };
       for (const it of plPreview.items) {
         if (it.yen != null) next[it.cell] = it.yen;
       }
-      return { ...p, [targetYM]: next };
+
+      // --- 施設費計・その他経費計から J35 / J40 を算出 ---
+      const raw = plPreview.raw || {};
+      const num = (v) => (v == null || v === "" ? 0 : Number(v) || 0);
+
+      // 家賃 J34：経理メイト設定を正とする（会社PLには単独項目が無い）
+      const rent = Number(settings.rent) || 0;
+      if (rent) next.J34 = rent;
+
+      // ロイヤリティ J36：DS請求書の税抜確定値。確定入力があればそれを優先、
+      // 無ければ 設定 or 売上×率 で暫定。（会社との突合基準はDS確定値）
+      if (next.J36 == null || next.J36 === "") {
+        const royaltyRate = Number(settings.royaltyRate) || 0.05;
+        const fromSettings = Number(settings.royaltyFixed);
+        next.J36 = isFinite(fromSettings) && fromSettings > 0
+          ? Math.round(fromSettings)
+          : Math.round(num(next.J16) * royaltyRate);
+      }
+
+      // J35（減価償却費）= 施設費計(AW15) − 家賃(J34)
+      if (raw.shisetsuKei != null) {
+        next.J35 = Math.round(raw.shisetsuKei - num(next.J34));
+      }
+
+      // J39（衛生費）：会社PLからは取得しない。未入力なら0扱い（算出用）
+      const j39 = num(next.J39);
+
+      // J40（その他）= その他経費計(AW28) −（J33+J36+J37+J38+J39）
+      //   会社回答により、雑費その他にロイヤリティが含まれるため J36 を減算に含める。
+      if (raw.sonotaKei != null) {
+        next.J40 = Math.round(
+          raw.sonotaKei - (num(next.J33) + num(next.J36) + num(next.J37) + num(next.J38) + j39)
+        );
+      }
+
+      // J41（概算消費税）：会社PL取込時は0。以降は手入力で上書き可能。
+      if (next.J41 == null || next.J41 === "") next.J41 = 0;
+
+      // --- 棚卸の翌月繰越：当月末棚卸(J26) → 翌月初棚卸(J25) を自動反映 ---
+      const result = { ...p, [targetYM]: next };
+      if (next.J26 != null && next.J26 !== "") {
+        const nextYM = ymPlus(targetYM, 1);
+        const nm = { ...(result[nextYM] || {}) };
+        // 翌月J25が未入力のときのみ自動繰越（手入力を尊重）
+        if (nm.J25 == null || nm.J25 === "") {
+          nm.J25 = Number(next.J26) || 0;
+          result[nextYM] = nm;
+        }
+      }
+      return result;
     });
     if (plPreview.ym && plPreview.ym !== ym) setYM(plPreview.ym);
     setPlMsg(`✓ ${targetYM} の確定欄へ反映しました（会社PLの ${plPreview.items.length} 項目）。`);
@@ -2088,7 +2171,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
       <div className="km-card">
         <div className="km-cardhead">会社PL（LD課収支表）から取込</div>
         <div className="km-note" style={{ marginTop: 0 }}>
-          会社配布のPL表（Excel）を読み込むと、「やっぱりステーキ三島店」の列から拾える項目（売上・人件費・福利・水光熱・消耗品・広告・その他）を抽出します。原価・家賃・減価償却・ロイヤリティ・棚卸・借入は対象外（日報／設定／手入力）です。
+          会社配布のLD課収支表（Excel）を読み込むと、三島店の列（AW列・実績）から売上・人件費・福利・水光熱・消耗品・広告を抽出します。あわせて施設費計(AW15)・その他経費計(AW28)を取得し、反映時に <b>J35 減価償却費 = 施設費計 − 家賃</b>、<b>J40 その他 = その他経費計 −（水光熱+ロイヤリティ+消耗品+広告+衛生費）</b> を自動計算します。ロイヤリティ(J36)はDS請求書の税抜確定値、家賃(J34)は設定値を使用。概算消費税(J41)は取込時0（手入力で上書き可）。原価・棚卸・借入は対象外（日報／設定／手入力）です。
         </div>
         <div className="km-row km-stats" style={{ marginTop: 12 }}>
           <label className="km-btn" style={{ cursor: "pointer", margin: 0 }}>
@@ -2548,6 +2631,7 @@ function Settings({ settings, setSettings, vendors, setVendors, reports, setRepo
           <Field label="減価償却費"><input type="number" value={settings.depreciation} onChange={set("depreciation")} /></Field>
           <Field label="借入元金返済"><input type="number" value={settings.loanRepay} onChange={set("loanRepay")} /></Field>
           <Field label="ロイヤリティ率" hint="標準0.05"><input type="number" step="0.001" value={settings.royaltyRate} onChange={set("royaltyRate")} /></Field>
+          <Field label="ロイヤリティ確定額（DS請求書・税抜）" hint="会社PL取込時のJ36に使用。空欄なら売上×率"><input type="number" value={settings.royaltyFixed} onChange={set("royaltyFixed")} /></Field>
         </div>
         <div className="km-note">
           これらは速報予測の固定費・売上連動費の見積りに使われ、月次突合フェーズで請求書の確定値に置き換えます。
