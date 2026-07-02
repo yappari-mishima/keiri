@@ -203,20 +203,29 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
     return xml.replace(re, cell);
   }
 
-  // 数式セルのキャッシュ値<v>を除去して、開いた時に確実に再計算させる。
-  // （I10=J16 / J46=SUM(J35) / N9 / R9 などの派生値を最新化するため）
-  function clearFormulaCache(xml, ref) {
-    var re = new RegExp('(<c r="' + ref + '"[^>]*>)([\\s\\S]*?)(</c>)');
-    return xml.replace(re, function (whole, open, inner, close) {
-      // <f ...>...</f> は残し、<v>...</v> のみ削除
-      var kept = inner.replace(/<v>[\s\S]*?<\/v>/, '');
-      return open + kept + close;
-    });
+  // 数値セルの現在値を読む（数式のキャッシュ<v>も読める）
+  function getNumCell(xml, ref) {
+    var re = new RegExp('<c r="' + ref + '"[^>]*?(?:/>|>([\\s\\S]*?)</c>)');
+    var m = re.exec(xml);
+    if (!m) return null;
+    var inner = m[1] || '';
+    var vM = /<v>([\s\S]*?)<\/v>/.exec(inner);
+    if (!vM) return null;
+    var n = Number(vM[1]);
+    return isFinite(n) ? n : null;
   }
 
-  // 依存の派生値を最新化するため、キャッシュを消す数式セル一覧
-  var RECALC_CELLS = ['I10', 'J46', 'N9', 'R9'];
-
+  // 数式セルの数式(<f>)は残し、キャッシュ値(<v>)を計算済みの値で置き換える。
+  // これによりExcelの再計算設定に依存せず、開いた瞬間に正しい値が表示される。
+  function setFormulaValue(xml, ref, val) {
+    var re = new RegExp('(<c r="' + ref + '"[^>]*>)([\\s\\S]*?)(</c>)');
+    var num = (val == null || !isFinite(val)) ? 0 : val;
+    return xml.replace(re, function (whole, open, inner, close) {
+      var fM = /<f[^>]*>[\s\S]*?<\/f>|<f[^>]*\/>/.exec(inner);
+      var fpart = fM ? fM[0] : '';
+      return open + fpart + '<v>' + num + '</v>' + close;
+    });
+  }
   // jValues: { J16:数値, ... }、textValues: { B3:'2026年5月', O5:'会社名', N10:'2026/07/02' }
   window.buildPLExcel = function (jValues, textValues) {
     var f = window.fflate;
@@ -234,10 +243,30 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
         }
       }
     }
-    // 派生数式セルのキャッシュを消して再計算を促す
-    for (var i = 0; i < RECALC_CELLS.length; i++) {
-      xml = clearFormulaCache(xml, RECALC_CELLS[i]);
+
+    // --- 派生数式セルの値をこちらで計算して埋め込む（再計算不要にする） ---
+    // 依存値：J16(売上税抜) / J35(減価償却) / P4(営業日数) / K11(客数) は上で書込済。
+    // N8(席数) / Q8 はテンプレ固定値を読む。
+    var J16 = getNumCell(xml, 'J16');
+    var J35 = getNumCell(xml, 'J35');
+    var P4  = getNumCell(xml, 'P4');
+    var K11 = getNumCell(xml, 'K11');
+    var N8  = getNumCell(xml, 'N8');
+    var Q8  = getNumCell(xml, 'Q8');
+
+    // I10 = J16
+    if (J16 != null) xml = setFormulaValue(xml, 'I10', J16);
+    // J46 = SUM(J35)
+    if (J35 != null) xml = setFormulaValue(xml, 'J46', J35);
+    // N9 = K11 / (N8 * P4)  … 席回転率
+    if (K11 != null && N8 != null && P4 != null && (N8 * P4) !== 0) {
+      xml = setFormulaValue(xml, 'N9', K11 / (N8 * P4));
     }
+    // R9 = J16 / Q8  … 客単価等
+    if (J16 != null && Q8 != null && Q8 !== 0) {
+      xml = setFormulaValue(xml, 'R9', J16 / Q8);
+    }
+
     zip[TARGET_SHEET] = f.strToU8(xml);
     // calcChain を削除（Excelが開く時に再構築。古い数式インデックス由来のエラーを防ぐ）
     delete zip['xl/calcChain.xml'];
@@ -251,17 +280,20 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
         .replace(/<Override [^>]*calcChain[^>]*\/>/g, '');
       zip['[Content_Types].xml'] = f.strToU8(ct);
     }
-    // 開いた時に全再計算させる（fullCalcOnLoad）。派生セル(I10/J46/N9/R9)を確実に最新化。
+    // 開いた時に全再計算させる。calcId="0" にすると Excel は「未知バージョンで計算された」
+    // とみなし強制再計算する。fullCalcOnLoad と併用して確実性を上げる。
     if (zip['xl/workbook.xml']) {
       var wb = f.strFromU8(zip['xl/workbook.xml']);
       if (/<calcPr[^>]*\/>/.test(wb)) {
         wb = wb.replace(/<calcPr([^>]*)\/>/, function (m0, a) {
-          var a2 = a.replace(/\sfullCalcOnLoad="[^"]*"/, '');
-          return '<calcPr' + a2 + ' fullCalcOnLoad="1"/>';
+          var a2 = a
+            .replace(/\sfullCalcOnLoad="[^"]*"/, '')
+            .replace(/\scalcId="[^"]*"/, '')
+            .replace(/\sforceFullCalc="[^"]*"/, '');
+          return '<calcPr' + a2 + ' calcId="0" fullCalcOnLoad="1" forceFullCalc="1"/>';
         });
       } else {
-        // calcPr が無ければ </workbook> 直前に挿入
-        wb = wb.replace(/<\/workbook>/, '<calcPr fullCalcOnLoad="1"/></workbook>');
+        wb = wb.replace(/<\/workbook>/, '<calcPr calcId="0" fullCalcOnLoad="1" forceFullCalc="1"/></workbook>');
       }
       zip['xl/workbook.xml'] = f.strToU8(wb);
     }
