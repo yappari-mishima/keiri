@@ -182,8 +182,43 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
     return xml; // 対象セルは必ず存在する前提
   }
 
-  // jValues: { J16:数値, ... } を受け取り、xlsxのUint8Arrayを返す
-  window.buildPLExcel = function (jValues) {
+  // XMLエスケープ
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+  }
+
+  // 文字列セルを inlineStr で書き込む（sharedStrings を触らず安全）。
+  // 元セルのスタイル(s属性)は維持する。
+  function setStrCell(xml, ref, text) {
+    var re = new RegExp('<c r="' + ref + '"([^>]*?)(?:/>|>[\\s\\S]*?</c>)');
+    var mm = re.exec(xml);
+    if (!mm) return xml; // 対象セルが無ければ何もしない
+    var attrs = mm[1] || '';
+    // s属性を抽出（無ければ既存styleを維持できないので省略）
+    var sM = /\ss="([^"]*)"/.exec(attrs);
+    var sAttr = sM ? ' s="' + sM[1] + '"' : '';
+    var cell = '<c r="' + ref + '"' + sAttr + ' t="inlineStr"><is><t xml:space="preserve">' + esc(text) + '</t></is></c>';
+    return xml.replace(re, cell);
+  }
+
+  // 数式セルのキャッシュ値<v>を除去して、開いた時に確実に再計算させる。
+  // （I10=J16 / J46=SUM(J35) / N9 / R9 などの派生値を最新化するため）
+  function clearFormulaCache(xml, ref) {
+    var re = new RegExp('(<c r="' + ref + '"[^>]*>)([\\s\\S]*?)(</c>)');
+    return xml.replace(re, function (whole, open, inner, close) {
+      // <f ...>...</f> は残し、<v>...</v> のみ削除
+      var kept = inner.replace(/<v>[\s\S]*?<\/v>/, '');
+      return open + kept + close;
+    });
+  }
+
+  // 依存の派生値を最新化するため、キャッシュを消す数式セル一覧
+  var RECALC_CELLS = ['I10', 'J46', 'N9', 'R9'];
+
+  // jValues: { J16:数値, ... }、textValues: { B3:'2026年5月', O5:'会社名', N10:'2026/07/02' }
+  window.buildPLExcel = function (jValues, textValues) {
     var f = window.fflate;
     var zip = f.unzipSync(b64ToU8(window.PL_TEMPLATE_B64));
     var xml = f.strFromU8(zip[TARGET_SHEET]);
@@ -191,6 +226,17 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
       if (Object.prototype.hasOwnProperty.call(jValues, ref)) {
         xml = setNumCell(xml, ref, jValues[ref]);
       }
+    }
+    if (textValues) {
+      for (var tref in textValues) {
+        if (Object.prototype.hasOwnProperty.call(textValues, tref)) {
+          xml = setStrCell(xml, tref, textValues[tref]);
+        }
+      }
+    }
+    // 派生数式セルのキャッシュを消して再計算を促す
+    for (var i = 0; i < RECALC_CELLS.length; i++) {
+      xml = clearFormulaCache(xml, RECALC_CELLS[i]);
     }
     zip[TARGET_SHEET] = f.strToU8(xml);
     // calcChain を削除（Excelが開く時に再構築。古い数式インデックス由来のエラーを防ぐ）
@@ -204,6 +250,20 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
       var ct = f.strFromU8(zip['[Content_Types].xml'])
         .replace(/<Override [^>]*calcChain[^>]*\/>/g, '');
       zip['[Content_Types].xml'] = f.strToU8(ct);
+    }
+    // 開いた時に全再計算させる（fullCalcOnLoad）。派生セル(I10/J46/N9/R9)を確実に最新化。
+    if (zip['xl/workbook.xml']) {
+      var wb = f.strFromU8(zip['xl/workbook.xml']);
+      if (/<calcPr[^>]*\/>/.test(wb)) {
+        wb = wb.replace(/<calcPr([^>]*)\/>/, function (m0, a) {
+          var a2 = a.replace(/\sfullCalcOnLoad="[^"]*"/, '');
+          return '<calcPr' + a2 + ' fullCalcOnLoad="1"/>';
+        });
+      } else {
+        // calcPr が無ければ </workbook> 直前に挿入
+        wb = wb.replace(/<\/workbook>/, '<calcPr fullCalcOnLoad="1"/></workbook>');
+      }
+      zip['xl/workbook.xml'] = f.strToU8(wb);
     }
     return f.zipSync(zip, { level: 6 });
   };
@@ -2121,7 +2181,19 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
         if (it.cell === "J11") v = v / 24;
         jv[it.cell] = v;
       }
-      const bytes = window.buildPLExcel(jv);
+      // --- 文字列セル（B3 年月 / O5 運営会社 / N10 出力日）---
+      const ymParts = /^(\d{4})-(\d{2})$/.exec(ym);
+      const ymLabel = ymParts
+        ? `${ymParts[1]}年${parseInt(ymParts[2], 10)}月`
+        : ym;
+      const today = new Date();
+      const outDate = `${today.getFullYear()}年${today.getMonth() + 1}月${today.getDate()}日`;
+      const tv = {
+        B3: ymLabel,                       // 対象年月（例: 2026年5月）
+        O5: settings.company || "",        // 運営会社（設定タブ）
+        N10: outDate,                      // 出力日
+      };
+      const bytes = window.buildPLExcel(jv, tv);
       const blob = new Blob([bytes], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
