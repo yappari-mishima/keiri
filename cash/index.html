@@ -641,7 +641,9 @@ function exportKakuninXlsx({
     const p = pieces(+d);
     if (p) setNum(DEN_ROW[d], p);
   });
-  // 調査者・店長（原紙では署名欄。値があれば備考的にB列へは入れず、印影欄は空のまま）
+  // 調査者・店長（原紙の署名欄 G25 / G27 へ記入）
+  setStr('G25', cur.inspector);
+  setStr('G27', cur.manager);
   files['xl/worksheets/sheet1.xml'] = new TextEncoder().encode(xml);
   const zip = window.fflate.zipSync(files);
   const blob = new Blob([zip], {
