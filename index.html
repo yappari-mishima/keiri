@@ -109,13 +109,60 @@ const KMStore = (function () {
   }
 
   let saveTimer = null;
+  let pendingData = null;   // 未送信の最新データ（デバウンス中/失敗時に保持）
+  let saving = false;       // クラウド保存の多重実行防止
+  let lastSavedAt = null;   // 直近のクラウド保存成功時刻
+
+  // 未送信フラグをローカルにも記録（再起動しても「まだクラウドに載っていない」を検知するため）
+  const DIRTY_KEY = "keiriMateDirty";
+  function markDirty(v) {
+    try {
+      if (v) localStorage.setItem(DIRTY_KEY, "1");
+      else localStorage.removeItem(DIRTY_KEY);
+    } catch (e) {}
+  }
+  function isDirtyPersisted() {
+    try { return localStorage.getItem(DIRTY_KEY) === "1"; } catch (e) { return false; }
+  }
+
+  // 保留中データを即座にクラウドへ送る（離脱時や手動フラッシュ用）
+  async function flushNow() {
+    if (!isCloud()) return { ok: false, error: "未設定" };
+    if (!pendingData) return { ok: true, savedAt: lastSavedAt, noop: true };
+    if (saving) return { ok: false, error: "保存中" };
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    saving = true;
+    const data = pendingData;
+    const res = await cloudSave(data);
+    saving = false;
+    if (res.ok) {
+      pendingData = null;               // 送信成功したら保留解除
+      lastSavedAt = res.savedAt || new Date().toISOString();
+      markDirty(false);
+    }
+    window.dispatchEvent(new CustomEvent("km-cloud-sync", { detail: res }));
+    return res;
+  }
+
   return {
-    // 起動時の読込: クラウド設定があればクラウド優先、無ければローカル
+    // 起動時の読込: クラウド設定があればクラウド優先、無ければローカル。
+    // ただしローカルに未送信(_dirty)がある場合はローカルを優先し、クラウドへ即再送する。
     async load() {
       if (isCloud()) {
+        // ローカルに未送信の変更が残っているなら、古いクラウドで上書きしない
+        if (isDirtyPersisted()) {
+          const localData = await loadLocal();
+          if (localData) {
+            // 未送信を復元し、直後に再送を仕掛ける
+            pendingData = JSON.parse(JSON.stringify(localData));
+            setTimeout(() => { flushNow(); }, 500);
+            return localData;
+          }
+        }
         const res = await cloudLoad();
         if (res.ok) {
-          if (res.data) { saveLocalNow(res.data); return res.data; }
+          if (res.data) { saveLocalNow(res.data); markDirty(false); return res.data; }
           // クラウドが空＝初回。ローカルにデータがあればそれを採用（後で保存される）
           return await loadLocal();
         }
@@ -128,13 +175,31 @@ const KMStore = (function () {
     save(data) {
       saveLocalNow(data);
       if (!isCloud()) return;
+      // 未送信データとして保持（離脱時に flushNow で確実に送る）
+      pendingData = JSON.parse(JSON.stringify(data));
+      markDirty(true);
+      window.dispatchEvent(new CustomEvent("km-cloud-pending", {}));
       clearTimeout(saveTimer);
       saveTimer = setTimeout(async () => {
-        const res = await cloudSave(data);
-        if (!res.ok) console.warn("cloud save failed:", res.error);
+        if (saving) return;             // 実行中なら次の変更でまた送られる
+        saving = true;
+        const send = pendingData;
+        const res = await cloudSave(send);
+        saving = false;
+        if (res.ok) {
+          // 送信中に新しい変更が来ていなければ保留解除
+          if (pendingData === send) { pendingData = null; markDirty(false); }
+          lastSavedAt = res.savedAt || new Date().toISOString();
+        } else {
+          console.warn("cloud save failed:", res.error);
+          // 失敗時は pendingData を保持（次の save / flushNow / online で再送）
+        }
         window.dispatchEvent(new CustomEvent("km-cloud-sync", { detail: res }));
       }, 1200);
     },
+    hasPending() { return !!pendingData || isDirtyPersisted(); },
+    getLastSavedAt() { return lastSavedAt; },
+    flushNow,
     // 設定タブから使う公開API
     getConfig, setConfig, isCloud,
     cloudLoad, cloudSave, loadLocal,
@@ -792,6 +857,9 @@ function App() {
   const [targets, setTargets] = useState({ daily: {}, monthly: {}, yearly: {} }); // 手入力目標
   const [confirms, setConfirms] = useState({}); // 月次突合の確定値 { "2026-05": { J16:数値, ... , _done:bool } }
   const [dashYM, setDashYM] = useState(""); // 速報タブの表示対象月（空=最新月）
+  // クラウド同期状態: "idle"(未設定) / "saved" / "pending"(未送信あり) / "error"
+  const [syncState, setSyncState] = useState("idle");
+  const [syncAt, setSyncAt] = useState(null);
 
   // ---- ブラウザ保存(IndexedDB) からの復元 / 自動保存 ----
   const [loaded, setLoaded] = React.useState(false);
@@ -809,10 +877,61 @@ function App() {
       setLoaded(true);
     })();
   }, []);
+  const skipFirstSave = React.useRef(true);
   React.useEffect(() => {
     if (!loaded) return;
+    // 初回（読込直後）のsaveは抑制：読み込んだデータをそのまま送り返して
+    // 「未保存」表示や不要な再送が出るのを防ぐ。
+    if (skipFirstSave.current) { skipFirstSave.current = false; return; }
     KMStore.save({ settings, vendors, reports, history, targets, confirms });
   }, [loaded, settings, vendors, reports, history, targets, confirms]);
+
+  // クラウド同期の状態をヘッダー表示用に購読
+  React.useEffect(() => {
+    if (!KMStore.isCloud()) { setSyncState("idle"); return; }
+    setSyncState(KMStore.hasPending() ? "pending" : "saved");
+    const onPending = () => setSyncState("pending");
+    const onSync = (e) => {
+      const r = e.detail || {};
+      if (r.ok) {
+        setSyncState(KMStore.hasPending() ? "pending" : "saved");
+        setSyncAt(KMStore.getLastSavedAt());
+      } else {
+        setSyncState("error");
+      }
+    };
+    window.addEventListener("km-cloud-pending", onPending);
+    window.addEventListener("km-cloud-sync", onSync);
+    return () => {
+      window.removeEventListener("km-cloud-pending", onPending);
+      window.removeEventListener("km-cloud-sync", onSync);
+    };
+  }, [loaded]);
+
+  // 保存失敗などで未送信が残った場合の自動再送：
+  // オンライン復帰時と、30秒ごとの点検で pending があれば流す。
+  React.useEffect(() => {
+    if (!loaded) return;
+    const retry = () => { if (KMStore.isCloud() && KMStore.hasPending()) KMStore.flushNow(); };
+    window.addEventListener("online", retry);
+    const iv = setInterval(retry, 30000);
+    return () => { window.removeEventListener("online", retry); clearInterval(iv); };
+  }, [loaded]);
+
+  // 離脱時（タブを閉じる/バックグラウンド化/リロード）に、未送信のクラウド保存を確実に流す。
+  // デバウンス1.2秒を待たずに閉じてもデータを取りこぼさないための保証。
+  React.useEffect(() => {
+    const flush = () => { try { KMStore.flushNow(); } catch (e) {} };
+    const onVis = () => { if (document.visibilityState === "hidden") flush(); };
+    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", flush);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", flush);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   // number入力欄でホイール/タッチパッドのスクロール中に値が変わるのを防ぐ
   React.useEffect(() => {
@@ -1031,6 +1150,34 @@ function App() {
             <div className="km-title">経理メイト</div>
             <div className="km-sub">速報フェーズ · {settings.storeName}</div>
           </div>
+          {syncState !== "idle" && (
+            <button
+              type="button"
+              className="km-sync"
+              title={
+                syncState === "pending" ? "未保存の変更があります。クリックで今すぐ保存"
+                : syncState === "error" ? "クラウド保存に失敗。クリックで再試行"
+                : "クラウド保存済み" + (syncAt ? "（" + new Date(syncAt).toLocaleTimeString() + "）" : "")
+              }
+              onClick={async () => { setSyncState("pending"); await KMStore.flushNow(); }}
+              style={{
+                marginLeft: 10, padding: "3px 9px", borderRadius: 999, border: "none",
+                cursor: "pointer", fontSize: 12, whiteSpace: "nowrap",
+                background:
+                  syncState === "saved" ? "rgba(90,160,90,.18)"
+                  : syncState === "pending" ? "rgba(210,160,60,.20)"
+                  : "rgba(200,70,60,.18)",
+                color:
+                  syncState === "saved" ? "#3c7a3c"
+                  : syncState === "pending" ? "#a9761f"
+                  : "#b4413c",
+              }}
+            >
+              {syncState === "saved" ? "☁ 保存済み"
+                : syncState === "pending" ? "☁ 未保存 · 今すぐ保存"
+                : "☁ 保存失敗 · 再試行"}
+            </button>
+          )}
         </div>
         <nav className="km-nav">
           {[["dash", "速報"], ["entry", "日報入力"], ["yoy", "前年比較"], ["goals", "目標設定"], ["recon", "月次突合"], ["log", "日報一覧"], ["vendor", "業者"], ["set", "設定"]].map(
