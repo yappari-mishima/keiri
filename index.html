@@ -430,7 +430,7 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
       var sonotaKei = yenOf(28); // r28 その他経費計（AW28）→ J40算出に使用
 
       var items = [
-        { cell: 'J16', label: '売上高（税抜）', yen: uriage, src: 'AW9 総売上高' },
+        // J16(売上高)は経理メイト速報から転記するため、会社PLからは取り込まない
         { cell: 'J30', label: '人件費（社員）', yen: kyuyo, src: 'AW11 給与' },
         { cell: 'J31', label: '人件費（パート）', yen: baito, src: 'AW13 アルバイト' },
         { cell: 'J32', label: '法定福利', yen: fukuri, src: 'AW12 福利厚生' },
@@ -447,6 +447,7 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
 
       // 参考表示（FCに自動反映しない）
       var info = [
+        { label: '売上高(AW9)※参考', yen: uriage },
         { label: '施設費計(AW15)', yen: shisetsu },
         { label: 'その他経費計(AW28)', yen: sonotaKei },
         { label: '本社費(AW33)', yen: yenOf(33) },
@@ -2089,6 +2090,8 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
   // 確定値（入力があればそれ、無ければ概算で補完）。原価J19〜J23は業者別請求の集計を使う。
   const confirmedOf = (cell, est) => {
     if (isGenkaCell(cell)) return genkaConfirmOf(cell);
+    // J16(売上高)は経理メイト速報の税抜売上をそのまま転記（確定手入力・会社PLより優先）
+    if (cell === "J16") return Math.round(agg.salesEx);
     const v = cur[cell];
     if (v != null && v !== "") return Number(v) || 0;
     return est != null ? est : 0;
@@ -2156,13 +2159,13 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
       if (rent) next.J34 = rent;
 
       // ロイヤリティ J36：DS請求書の税抜確定値。確定入力があればそれを優先、
-      // 無ければ 設定 or 売上×率 で暫定。（会社との突合基準はDS確定値）
+      // 無ければ 設定 or 速報売上×率 で暫定。（会社との突合基準はDS確定値）
       if (next.J36 == null || next.J36 === "") {
         const royaltyRate = Number(settings.royaltyRate) || 0.05;
         const fromSettings = Number(settings.royaltyFixed);
         next.J36 = isFinite(fromSettings) && fromSettings > 0
           ? Math.round(fromSettings)
-          : Math.round(num(next.J16) * royaltyRate);
+          : Math.round((Number(agg.salesEx) || 0) * royaltyRate);
       }
 
       // J35（減価償却費）= 施設費計(AW15) − 家賃(J34)
