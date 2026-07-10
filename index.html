@@ -1896,7 +1896,8 @@ function Goals({ targets, setTargets, history, reports }) {
     const curYM = repDates.length ? ymOf(repDates.sort().reverse()[0]) : null;
     for (const r of (reports || [])) {
       if (!r.date) continue;
-      if (curYM && ymOf(r.date) !== curYM) continue;
+      const isCurMonth = curYM && ymOf(r.date) === curYM;
+      if (!isCurMonth && map[r.date]) continue;
       const inc = Number(r.salesInc) || 0;
       const g = Number(r.guests) || 0;
       if (inc === 0 && g === 0) continue;
@@ -2962,7 +2963,8 @@ function YoY({ history, setHistory, targets, setTargets, reports, setReports }) 
     const curYM = repDates.length ? ymOf(repDates.sort().reverse()[0]) : null;
     for (const r of reports) {
       if (!r.date) continue;
-      if (curYM && ymOf(r.date) !== curYM) continue; // 当月分のみ反映
+      const isCurMonth = curYM && ymOf(r.date) === curYM;
+      if (!isCurMonth && map[r.date]) continue; // 過去月はCSV優先、CSVが無い日だけ日報で補完
       const inc = Number(r.salesInc) || 0;
       const g = Number(r.guests) || 0;
       if (inc === 0 && g === 0) continue;
