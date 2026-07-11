@@ -28,9 +28,101 @@
 <body>
 <div id="root"><div class="km-boot">経理メイトを起動中…</div></div>
 <script>
+/* =====================================================================
+   店舗レジストリ (KMStores)
+   複数店舗対応の土台。店舗一覧と「現在選択中の店舗ID」を localStorage で管理する。
+   - 店舗ごとに IndexedDBキー "main:<storeId>"、クラウド設定も店舗別。
+   - 旧・単一店舗版（keiriMateDB / key "main"）は三島店(id:"mishima")として自動移行。
+   ===================================================================== */
+const KMStores = (function () {
+  const LIST_KEY = "keiriMateStores";      // localStorage: [{id,name}]
+  const CUR_KEY  = "keiriMateCurrentStore"; // localStorage: storeId
+  const MIGRATED_KEY = "keiriMateMigratedV2"; // 旧main→mishima 移行済みフラグ
+
+  // 旧単一店舗版からの既定：三島店。以後の新規店舗は任意ID。
+  const DEFAULT_STORE = { id: "mishima", name: "三島店" };
+
+  function readList() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(LIST_KEY) || "null");
+      if (Array.isArray(raw) && raw.length) return raw;
+    } catch (e) {}
+    return null;
+  }
+  function writeList(list) {
+    try { localStorage.setItem(LIST_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+
+  // 店舗一覧を取得（無ければ三島店だけの初期リストを作成）
+  function list() {
+    let l = readList();
+    if (!l) { l = [{ ...DEFAULT_STORE }]; writeList(l); }
+    return l;
+  }
+  function currentId() {
+    const l = list();
+    let id = null;
+    try { id = localStorage.getItem(CUR_KEY); } catch (e) {}
+    if (!id || !l.some((s) => s.id === id)) {
+      id = l[0].id;
+      try { localStorage.setItem(CUR_KEY, id); } catch (e) {}
+    }
+    return id;
+  }
+  function setCurrent(id) {
+    if (!list().some((s) => s.id === id)) return false;
+    try { localStorage.setItem(CUR_KEY, id); } catch (e) {}
+    return true;
+  }
+  function nameOf(id) {
+    const s = list().find((x) => x.id === id);
+    return s ? s.name : id;
+  }
+  // 新規店舗を追加（idは英数字。重複不可）。返り値：追加した店舗 or null
+  function add(name, id) {
+    const l = list();
+    let sid = (id || "").trim();
+    if (!sid) {
+      // 名前から簡易ID生成（英数字化＋連番でユニーク化）
+      const base = "store" + (Date.now().toString(36));
+      sid = base;
+    }
+    if (l.some((s) => s.id === sid)) return null;
+    const store = { id: sid, name: (name || sid).trim() };
+    l.push(store); writeList(l);
+    return store;
+  }
+  function rename(id, name) {
+    const l = list();
+    const s = l.find((x) => x.id === id);
+    if (!s) return false;
+    s.name = (name || s.name).trim();
+    writeList(l);
+    return true;
+  }
+
+  // 旧・単一店舗版（key "main"）を三島店(mishima)に一度だけ移行する。
+  // KMStore.load() から呼ばれる。実データのコピーは KMStore 側で行う。
+  function needsLegacyMigration() {
+    try { return localStorage.getItem(MIGRATED_KEY) !== "1"; } catch (e) { return false; }
+  }
+  function markMigrated() {
+    try { localStorage.setItem(MIGRATED_KEY, "1"); } catch (e) {}
+  }
+
+  return {
+    list, currentId, setCurrent, nameOf, add, rename,
+    needsLegacyMigration, markMigrated,
+    DEFAULT_STORE,
+  };
+})();
+
 const KMStore = (function () {
-  const DB = "keiriMateDB", STORE = "state", KEY = "main";
-  const CFG_KEY = "keiriMateCloud"; // localStorage: { url, token }
+  const DB = "keiriMateDB", STORE = "state";
+  const LEGACY_KEY = "main"; // 旧・単一店舗版のレコードキー
+  // 店舗別のレコードキー・クラウド設定キー
+  const recKey = (storeId) => "main:" + storeId;
+  const dirtyKey = (storeId) => "keiriMateDirty:" + storeId;
 
   function open() {
     return new Promise((res, rej) => {
@@ -42,50 +134,84 @@ const KMStore = (function () {
   }
 
   // ---- ローカル(IndexedDB) ----
-  function loadLocal() {
+  // 任意キーを読む汎用ヘルパ
+  function getKey(key) {
     return (async () => {
       try {
         const db = await open();
         return await new Promise((res) => {
-          const tx = db.transaction(STORE, "readonly").objectStore(STORE).get(KEY);
+          const tx = db.transaction(STORE, "readonly").objectStore(STORE).get(key);
           tx.onsuccess = () => res(tx.result || null);
           tx.onerror = () => res(null);
         });
       } catch (e) { return null; }
     })();
   }
-  function saveLocalNow(data) {
+  function putKey(key, data) {
     return (async () => {
       try {
         const db = await open();
-        db.transaction(STORE, "readwrite").objectStore(STORE).put(JSON.parse(JSON.stringify(data)), KEY);
+        db.transaction(STORE, "readwrite").objectStore(STORE)
+          .put(JSON.parse(JSON.stringify(data)), key);
       } catch (e) { console.warn("local save failed", e); }
     })();
   }
+  function loadLocal(storeId) { return getKey(recKey(storeId)); }
+  function saveLocalNow(storeId, data) { return putKey(recKey(storeId), data); }
 
-  // ---- クラウド設定 (localStorage) ----
+  // ---- クラウド設定 (localStorage・全店共通) ----
+  // 方式：URL/token は全店共通の1件。保存/読込時に storeId を付けて
+  // 1つのGASが店舗ごとにシートを出し分ける前提。
+  const COMMON_CFG_KEY = "keiriMateCloudCommon"; // { url, token }
+  const LEGACY_CFG_PREFIX = "keiriMateCloud:";   // 旧・店舗別設定（移行元）
+
   function getConfig() {
-    try { return JSON.parse(localStorage.getItem(CFG_KEY) || "null"); } catch (e) { return null; }
+    try {
+      const c = JSON.parse(localStorage.getItem(COMMON_CFG_KEY) || "null");
+      if (c && c.url) return c;
+    } catch (e) {}
+    return null;
   }
   function setConfig(cfg) {
-    if (cfg && cfg.url) localStorage.setItem(CFG_KEY, JSON.stringify({ url: cfg.url, token: cfg.token || "" }));
-    else localStorage.removeItem(CFG_KEY);
+    if (cfg && cfg.url) localStorage.setItem(COMMON_CFG_KEY, JSON.stringify({ url: cfg.url, token: cfg.token || "" }));
+    else localStorage.removeItem(COMMON_CFG_KEY);
   }
+  // 共通設定があれば全店でクラウド連携ON（store引数は互換のため受けるが無視）
   function isCloud() { const c = getConfig(); return !!(c && c.url); }
 
-  // ---- クラウド(GAS) 通信 ----
-  async function cloudLoad() {
+  // 旧・店舗別クラウド設定（keiriMateCloud:<id>）を共通設定へ一度だけ昇格する。
+  function migrateCloudConfigIfNeeded() {
+    try {
+      if (getConfig()) return; // 既に共通設定あり
+      // 旧キーを走査し、最初に見つかったURL付き設定を共通へ昇格
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.indexOf(LEGACY_CFG_PREFIX) === 0) {
+          const old = JSON.parse(localStorage.getItem(k) || "null");
+          if (old && old.url) {
+            localStorage.setItem(COMMON_CFG_KEY, JSON.stringify({ url: old.url, token: old.token || "" }));
+            break;
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  // ---- クラウド(GAS) 通信（storeIdをクエリ/ボディに付与）----
+  async function cloudLoad(storeId) {
     const c = getConfig();
     if (!c || !c.url) return { ok: false, error: "未設定" };
     try {
-      const u = c.url + (c.url.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(c.token || "");
+      const sep = c.url.indexOf("?") >= 0 ? "&" : "?";
+      const u = c.url + sep + "token=" + encodeURIComponent(c.token || "")
+        + "&storeId=" + encodeURIComponent(storeId || "");
       const r = await fetch(u, { method: "GET" });
       const j = await r.json();
       if (!j.ok) return { ok: false, error: j.error || "読込失敗" };
       return { ok: true, data: j.data || null };
     } catch (e) { return { ok: false, error: String(e) }; }
   }
-  async function cloudSave(data) {
+  async function cloudSave(storeId, data) {
     const c = getConfig();
     if (!c || !c.url) return { ok: false, error: "未設定" };
     try {
@@ -94,7 +220,11 @@ const KMStore = (function () {
         method: "POST",
         headers: { "Content-Type": "text/plain;charset=utf-8" },
         redirect: "follow",
-        body: JSON.stringify({ token: c.token || "", data: JSON.parse(JSON.stringify(data)) }),
+        body: JSON.stringify({
+          token: c.token || "",
+          storeId: storeId || "",
+          data: JSON.parse(JSON.stringify(data)),
+        }),
       });
       const text = await r.text();
       let j;
@@ -108,101 +238,143 @@ const KMStore = (function () {
     } catch (e) { return { ok: false, error: String(e) }; }
   }
 
+  // 現在アクティブな店舗ID（load/use で設定）。デバウンス状態はこの1店舗ぶんだけ保持する。
+  let curStoreId = null;
   let saveTimer = null;
   let pendingData = null;   // 未送信の最新データ（デバウンス中/失敗時に保持）
   let saving = false;       // クラウド保存の多重実行防止
   let lastSavedAt = null;   // 直近のクラウド保存成功時刻
 
   // 未送信フラグをローカルにも記録（再起動しても「まだクラウドに載っていない」を検知するため）
-  const DIRTY_KEY = "keiriMateDirty";
-  function markDirty(v) {
+  function markDirty(storeId, v) {
     try {
-      if (v) localStorage.setItem(DIRTY_KEY, "1");
-      else localStorage.removeItem(DIRTY_KEY);
+      if (v) localStorage.setItem(dirtyKey(storeId), "1");
+      else localStorage.removeItem(dirtyKey(storeId));
     } catch (e) {}
   }
-  function isDirtyPersisted() {
-    try { return localStorage.getItem(DIRTY_KEY) === "1"; } catch (e) { return false; }
+  function isDirtyPersisted(storeId) {
+    try { return localStorage.getItem(dirtyKey(storeId)) === "1"; } catch (e) { return false; }
   }
 
   // 保留中データを即座にクラウドへ送る（離脱時や手動フラッシュ用）
   async function flushNow() {
-    if (!isCloud()) return { ok: false, error: "未設定" };
+    const sid = curStoreId;
+    if (!sid || !isCloud(sid)) return { ok: false, error: "未設定" };
     if (!pendingData) return { ok: true, savedAt: lastSavedAt, noop: true };
     if (saving) return { ok: false, error: "保存中" };
     clearTimeout(saveTimer);
     saveTimer = null;
     saving = true;
     const data = pendingData;
-    const res = await cloudSave(data);
+    const res = await cloudSave(sid, data);
     saving = false;
     if (res.ok) {
       pendingData = null;               // 送信成功したら保留解除
       lastSavedAt = res.savedAt || new Date().toISOString();
-      markDirty(false);
+      markDirty(sid, false);
     }
     window.dispatchEvent(new CustomEvent("km-cloud-sync", { detail: res }));
     return res;
   }
 
+  // 旧・単一店舗版（key "main"）を三島店(mishima)へ一度だけ移行する。
+  async function migrateLegacyIfNeeded() {
+    if (!KMStores.needsLegacyMigration()) return;
+    try {
+      const legacy = await getKey(LEGACY_KEY);
+      const mishima = await getKey(recKey("mishima"));
+      // 旧データがあり、かつ mishima がまだ空なら移す
+      if (legacy && !mishima) {
+        await putKey(recKey("mishima"), legacy);
+        // 旧クラウド設定は共通設定(COMMON_CFG_KEY)へ、dirtyフラグは三島店へ引き継ぐ
+        try {
+          const oldCfg = JSON.parse(localStorage.getItem("keiriMateCloud") || "null");
+          if (oldCfg && oldCfg.url && !localStorage.getItem(COMMON_CFG_KEY)) {
+            localStorage.setItem(COMMON_CFG_KEY, JSON.stringify({ url: oldCfg.url, token: oldCfg.token || "" }));
+          }
+          if (localStorage.getItem("keiriMateDirty") === "1" && !localStorage.getItem(dirtyKey("mishima"))) {
+            localStorage.setItem(dirtyKey("mishima"), "1");
+          }
+        } catch (e) {}
+      }
+    } catch (e) { console.warn("legacy migration failed", e); }
+    KMStores.markMigrated();
+  }
+
   return {
-    // 起動時の読込: クラウド設定があればクラウド優先、無ければローカル。
-    // ただしローカルに未送信(_dirty)がある場合はローカルを優先し、クラウドへ即再送する。
-    async load() {
+    // 起動時／店舗切替時の読込。storeId を現在の店舗として設定し、デバウンス状態をリセット。
+    // クラウド設定があればクラウド優先、無ければローカル。
+    // ローカルに未送信(_dirty)がある場合はローカルを優先し、クラウドへ即再送する。
+    async load(storeId) {
+      await migrateLegacyIfNeeded();
+      migrateCloudConfigIfNeeded();
+      // 直前店舗の未送信があれば取りこぼさないよう流してから切替
+      if (curStoreId && curStoreId !== storeId && pendingData) {
+        try { await flushNow(); } catch (e) {}
+      }
+      curStoreId = storeId;
+      // 店舗が変わったのでデバウンス状態を初期化
+      clearTimeout(saveTimer); saveTimer = null;
+      pendingData = null; saving = false; lastSavedAt = null;
+
       if (isCloud()) {
-        // ローカルに未送信の変更が残っているなら、古いクラウドで上書きしない
-        if (isDirtyPersisted()) {
-          const localData = await loadLocal();
+        if (isDirtyPersisted(storeId)) {
+          const localData = await loadLocal(storeId);
           if (localData) {
-            // 未送信を復元し、直後に再送を仕掛ける
             pendingData = JSON.parse(JSON.stringify(localData));
             setTimeout(() => { flushNow(); }, 500);
             return localData;
           }
         }
-        const res = await cloudLoad();
+        const res = await cloudLoad(storeId);
         if (res.ok) {
-          if (res.data) { saveLocalNow(res.data); markDirty(false); return res.data; }
-          // クラウドが空＝初回。ローカルにデータがあればそれを採用（後で保存される）
-          return await loadLocal();
+          if (res.data) { saveLocalNow(storeId, res.data); markDirty(storeId, false); return res.data; }
+          return await loadLocal(storeId);
         }
-        // クラウド接続失敗 → ローカルキャッシュにフォールバック（オフライン継続）
         console.warn("cloud load failed:", res.error);
       }
-      return await loadLocal();
+      return await loadLocal(storeId);
     },
-    // 通常保存: ローカル即時 + クラウドへデバウンス送信
+    // 通常保存: ローカル即時 + クラウドへデバウンス送信（現在の店舗ぶん）
     save(data) {
-      saveLocalNow(data);
+      const sid = curStoreId;
+      if (!sid) return;
+      saveLocalNow(sid, data);
       if (!isCloud()) return;
-      // 未送信データとして保持（離脱時に flushNow で確実に送る）
       pendingData = JSON.parse(JSON.stringify(data));
-      markDirty(true);
+      markDirty(sid, true);
       window.dispatchEvent(new CustomEvent("km-cloud-pending", {}));
       clearTimeout(saveTimer);
       saveTimer = setTimeout(async () => {
-        if (saving) return;             // 実行中なら次の変更でまた送られる
+        if (saving) return;
         saving = true;
         const send = pendingData;
-        const res = await cloudSave(send);
+        const res = await cloudSave(sid, send);
         saving = false;
         if (res.ok) {
-          // 送信中に新しい変更が来ていなければ保留解除
-          if (pendingData === send) { pendingData = null; markDirty(false); }
+          if (pendingData === send) { pendingData = null; markDirty(sid, false); }
           lastSavedAt = res.savedAt || new Date().toISOString();
         } else {
           console.warn("cloud save failed:", res.error);
-          // 失敗時は pendingData を保持（次の save / flushNow / online で再送）
         }
         window.dispatchEvent(new CustomEvent("km-cloud-sync", { detail: res }));
       }, 1200);
     },
-    hasPending() { return !!pendingData || isDirtyPersisted(); },
+    currentStoreId() { return curStoreId; },
+    hasPending() { return !!pendingData || (curStoreId ? isDirtyPersisted(curStoreId) : false); },
     getLastSavedAt() { return lastSavedAt; },
     flushNow,
-    // 設定タブから使う公開API
-    getConfig, setConfig, isCloud,
-    cloudLoad, cloudSave, loadLocal,
+    // クラウド設定は全店共通（storeIdは通信時に自動付与）
+    isCloud() { return isCloud(); },
+    getConfig() { return getConfig(); },
+    setConfig(cfg) { return setConfig(cfg); },
+    // 設定タブの「クラウドへ/から」ボタン用：現在の店舗に対して実行
+    cloudLoad(storeId) { return cloudLoad(storeId || curStoreId); },
+    cloudSave(storeId, data) {
+      if (data === undefined) return cloudSave(curStoreId, storeId); // cloudSave(data)
+      return cloudSave(storeId, data);
+    },
+    loadLocal(storeId) { return loadLocal(storeId || curStoreId); },
   };
 })();
 </script>
@@ -861,23 +1033,42 @@ function App() {
   const [syncState, setSyncState] = useState("idle");
   const [syncAt, setSyncAt] = useState(null);
 
+  // ---- 店舗（複数店舗対応）----
+  const [storeId, setStoreId] = useState(() => KMStores.currentId());
+  const [storeList, setStoreList] = useState(() => KMStores.list());
+
   // ---- ブラウザ保存(IndexedDB) からの復元 / 自動保存 ----
   const [loaded, setLoaded] = React.useState(false);
-  React.useEffect(() => {
-    (async () => {
-      const d = await KMStore.load();
-      if (d) {
-        if (d.settings) setSettings(d.settings);
-        if (d.vendors) setVendors(d.vendors);
-        if (d.reports) setReports(d.reports);
-        if (d.history) setHistory(d.history);
-        if (d.targets) setTargets(d.targets);
-        if (d.confirms) setConfirms(d.confirms);
-      }
-      setLoaded(true);
-    })();
-  }, []);
   const skipFirstSave = React.useRef(true);
+
+  // 指定店舗のデータを読み込んで全stateに反映する共通処理
+  async function loadStoreData(sid) {
+    setLoaded(false);
+    skipFirstSave.current = true; // 読込直後の保存を抑制
+    const d = await KMStore.load(sid);
+    setSettings(d && d.settings ? d.settings : { ...DEFAULT_SETTINGS, storeName: KMStores.nameOf(sid) });
+    setVendors(d && d.vendors ? d.vendors : DEFAULT_VENDORS);
+    setReports(d && d.reports ? d.reports : []);
+    setHistory(d && d.history ? d.history : []);
+    setTargets(d && d.targets ? d.targets : { daily: {}, monthly: {}, yearly: {} });
+    setConfirms(d && d.confirms ? d.confirms : {});
+    setDashYM("");
+    setLoaded(true);
+  }
+
+  React.useEffect(() => {
+    loadStoreData(storeId);
+    // eslint-disable-next-line
+  }, []);
+
+  // 店舗切替：現在店舗の未送信を確実に流してから、新店舗を読み込む
+  async function switchStore(nextId) {
+    if (nextId === storeId) return;
+    try { await KMStore.flushNow(); } catch (e) {}
+    KMStores.setCurrent(nextId);
+    setStoreId(nextId);
+    await loadStoreData(nextId);
+  }
   React.useEffect(() => {
     if (!loaded) return;
     // 初回（読込直後）のsaveは抑制：読み込んだデータをそのまま送り返して
@@ -906,7 +1097,7 @@ function App() {
       window.removeEventListener("km-cloud-pending", onPending);
       window.removeEventListener("km-cloud-sync", onSync);
     };
-  }, [loaded]);
+  }, [loaded, storeId]);
 
   // 保存失敗などで未送信が残った場合の自動再送：
   // オンライン復帰時と、30秒ごとの点検で pending があれば流す。
@@ -1150,6 +1341,21 @@ function App() {
             <div className="km-title">経理メイト</div>
             <div className="km-sub">速報フェーズ · {settings.storeName}</div>
           </div>
+          <select
+            className="km-storesel"
+            value={storeId}
+            onChange={(e) => switchStore(e.target.value)}
+            title="店舗を切り替え"
+            style={{
+              marginLeft: 12, padding: "4px 8px", borderRadius: 8,
+              border: "1px solid rgba(0,0,0,.15)", fontSize: 13, cursor: "pointer",
+              background: "rgba(255,255,255,.85)", maxWidth: 160,
+            }}
+          >
+            {storeList.map((s) => (
+              <option key={s.id} value={s.id}>{s.name}</option>
+            ))}
+          </select>
           {syncState !== "idle" && (
             <button
               type="button"
@@ -1214,6 +1420,8 @@ function App() {
             history={history} setHistory={setHistory}
             targets={targets} setTargets={setTargets}
             confirms={confirms} setConfirms={setConfirms}
+            storeId={storeId} storeList={storeList} setStoreList={setStoreList}
+            switchStore={switchStore}
           />
         )}
       </main>
@@ -1897,7 +2105,7 @@ function Goals({ targets, setTargets, history, reports }) {
     for (const r of (reports || [])) {
       if (!r.date) continue;
       const isCurMonth = curYM && ymOf(r.date) === curYM;
-      if (!isCurMonth && map[r.date]) continue;
+      if (!isCurMonth && map[r.date]) continue; // 過去月はCSV優先、CSVが無い日だけ日報で補完
       const inc = Number(r.salesInc) || 0;
       const g = Number(r.guests) || 0;
       if (inc === 0 && g === 0) continue;
@@ -2658,7 +2866,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
 }
 
 // ============================== 設定 ==============================
-function Settings({ settings, setSettings, vendors, setVendors, reports, setReports, history, setHistory, targets, setTargets, confirms, setConfirms }) {
+function Settings({ settings, setSettings, vendors, setVendors, reports, setReports, history, setHistory, targets, setTargets, confirms, setConfirms, storeId, storeList, setStoreList, switchStore }) {
   const set = (k) => (e) =>
     setSettings((s) => ({ ...s, [k]: e.target.value }));
 
@@ -2819,20 +3027,89 @@ function Settings({ settings, setSettings, vendors, setVendors, reports, setRepo
     reader.readAsText(file, "utf-8");
   }
 
+  // ---- 店舗管理（複数店舗対応）----
+  const [newStoreName, setNewStoreName] = useState("");
+  const [newStoreId, setNewStoreId] = useState("");
+  const [storeMsg, setStoreMsg] = useState("");
+  const curStore = (storeList || []).find((s) => s.id === storeId) || { id: storeId, name: settings.storeName };
+  const [renameVal, setRenameVal] = useState(curStore.name);
+  useEffect(() => { setRenameVal(curStore.name); }, [storeId]);
+
+  function handleAddStore() {
+    const nm = (newStoreName || "").trim();
+    if (!nm) { setStoreMsg("✗ 店舗名を入力してください。"); return; }
+    const idRaw = (newStoreId || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+    const store = KMStores.add(nm, idRaw || undefined);
+    if (!store) { setStoreMsg("✗ そのID（" + idRaw + "）は既に使われています。別のIDにしてください。"); return; }
+    setStoreList(KMStores.list());
+    setNewStoreName(""); setNewStoreId("");
+    setStoreMsg("✓ 「" + store.name + "」を追加しました（ID: " + store.id + "）。切り替えると空の状態で開始します。");
+  }
+  function handleRenameStore() {
+    const nm = (renameVal || "").trim();
+    if (!nm) { setStoreMsg("✗ 店舗名を入力してください。"); return; }
+    KMStores.rename(storeId, nm);
+    setStoreList(KMStores.list());
+    // 現在店舗の settings.storeName も合わせて更新（表示整合）
+    setSettings((s) => ({ ...s, storeName: nm }));
+    setStoreMsg("✓ 店舗名を「" + nm + "」に変更しました。");
+  }
+
+  // 店舗切替時：クラウド設定は全店共通なのでURL/tokenは維持。表示メッセージのみクリア。
+  useEffect(() => {
+    setCloudMsg(""); setSyncMsg("");
+    // eslint-disable-next-line
+  }, [storeId]);
+
   return (
     <div className="km-page">
       <div className="km-card">
-        <div className="km-cardhead">クラウド連携（Google Sheets）</div>
+        <div className="km-cardhead">店舗管理（複数店舗対応）</div>
         <div className="km-note" style={{ marginTop: 0 }}>
-          Google Apps Script のウェブアプリURLと合言葉（トークン）を設定すると、入力データが自動的にGoogleスプレッドシートへ保存され、別PCでも同じデータを共有できます。
+          店舗ごとにデータ（日報・業者・突合・損益）とクラウド設定を分けて管理します。
+          上部のプルダウンで店舗を切り替えられます。現在の店舗：<b>{curStore.name}</b>（ID: {curStore.id}）
+        </div>
+
+        <div className="km-form" style={{ marginTop: 12 }}>
+          <Field label="現在の店舗名を変更">
+            <div style={{ display: "flex", gap: 8 }}>
+              <input value={renameVal} onChange={(e) => setRenameVal(e.target.value)} />
+              <button className="km-btn" onClick={handleRenameStore}>名称変更</button>
+            </div>
+          </Field>
+        </div>
+
+        <div className="km-note" style={{ marginTop: 16, fontWeight: 600 }}>新しい店舗を追加</div>
+        <div className="km-form" style={{ marginTop: 8 }}>
+          <Field label="店舗名" hint="例：静岡インター店">
+            <input value={newStoreName} onChange={(e) => setNewStoreName(e.target.value)} placeholder="静岡インター店" />
+          </Field>
+          <Field label="店舗ID（任意・英数字）" hint="空欄なら自動生成。スプレッドシート/キーの識別に使用">
+            <input value={newStoreId} onChange={(e) => setNewStoreId(e.target.value)} placeholder="shizuoka-inter" />
+          </Field>
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
+          <button className="km-btn km-btn-primary" onClick={handleAddStore}>＋ 店舗を追加</button>
+        </div>
+        {storeMsg && <div className="km-note" style={{ marginTop: 12, color: storeMsg[0] === "✗" ? "#b4413c" : "var(--accent)" }}>{storeMsg}</div>}
+        <div className="km-note" style={{ marginTop: 12 }}>
+          ※ 追加した店舗は空の状態で始まります。切り替え後に設定・業者・日報を入力してください。
+          クラウド連携は<b>全店共通のURL・合言葉を1回だけ</b>設定すれば、保存時に店舗ID（{curStore.id} など）が自動付与され、1つのスプレッドシートに店舗ごと分かれて保存されます（下の「クラウド連携」を参照）。
+        </div>
+      </div>
+
+      <div className="km-card">
+        <div className="km-cardhead">クラウド連携（Google Sheets）<span style={{ fontSize: 12, fontWeight: 400, color: "var(--dim)", marginLeft: 8 }}>／ 全店共通</span></div>
+        <div className="km-note" style={{ marginTop: 0 }}>
+          Google Apps Script のウェブアプリURLと合言葉（トークン）を<b>全店共通で1回</b>設定します。保存・読込のたびにアプリが現在の店舗ID（例：{curStore.id}）を自動で付けて送るため、1つのGAS・1つのスプレッドシートで全店ぶんを店舗別に管理できます。
           未設定の場合はこのPCのみ（ローカル保存）で動作します。
         </div>
         <div className="km-form" style={{ marginTop: 10 }}>
           <Field label="ウェブアプリURL" hint="https://script.google.com/macros/s/.../exec">
             <input value={cloudUrl} onChange={(e) => setCloudUrl(e.target.value)} placeholder="https://script.google.com/macros/s/XXXX/exec" />
           </Field>
-          <Field label="合言葉（トークン）" hint="GAS側の TOKEN と一致させる">
-            <input value={cloudToken} onChange={(e) => setCloudToken(e.target.value)} placeholder="mishima-9f3k-2026" />
+          <Field label="合言葉（トークン）" hint="GAS側の TOKEN と一致させる（全店共通）">
+            <input value={cloudToken} onChange={(e) => setCloudToken(e.target.value)} placeholder="yappari-shared-2026" />
           </Field>
         </div>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 12 }}>
