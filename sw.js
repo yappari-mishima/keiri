@@ -1,7 +1,7 @@
 /* 経理メイト サービスワーカー
    index.html（アプリ本体）をキャッシュし、オフラインでも起動できるようにする。
    アプリを更新したら CACHE_VERSION を上げると、次回オンライン時に新版へ入れ替わる。 */
-const CACHE_VERSION = "keiri-multi-v3";
+const CACHE_VERSION = "keiri-multi-v4";
 const APP_SHELL = "./";
 
 self.addEventListener("install", (e) => {
