@@ -433,6 +433,22 @@ const KMStore = (function () {
         return { ok: true, savedAt: j.savedAt };
       } catch (e) { return { ok: false, error: String(e) }; }
     },
+    // 全店の集約データを取得（storeId=all）。店舗比較タブ用。
+    async cloudLoadAll() {
+      const c = getConfig();
+      if (!c || !c.url) return { ok: false, error: "未設定" };
+      try {
+        const sep = c.url.indexOf("?") >= 0 ? "&" : "?";
+        const u = c.url + sep + "token=" + encodeURIComponent(c.token || "") + "&storeId=all";
+        const r = await fetch(u, { method: "GET" });
+        const j = await r.json();
+        if (!j.ok) return { ok: false, error: j.error || "読込失敗" };
+        return { ok: true, data: j.data || {} };
+      } catch (e) { return { ok: false, error: String(e) }; }
+    },
+    // 汎用キャッシュ（IndexedDB）。店舗比較の集約データをオフライン用に保持。
+    cacheGet(name) { return getKey("cache:" + name); },
+    cacheSet(name, data) { return putKey("cache:" + name, data); },
   };
 })();
 </script>
@@ -1078,6 +1094,109 @@ function meatPeriodKey(dateStr) {
   return `${py}-${String(pm).padStart(2, "0")}`;
 }
 
+// ===== 店舗比較用: 任意店舗の生データから当月累計の指標を計算する純関数 =====
+// data = { settings, vendors, reports, history, targets }（集約APIが返す1店分）
+// ymSel = "2026-05" 等。空なら data.reports の最新月を対象。
+// 速報タブ(calc)と同じロジックで、比較に使う主要指標を返す。
+function computeStoreMetrics(data, ymSel) {
+  const reports = (data && data.reports) || [];
+  const history = (data && data.history) || [];
+  const targets = (data && data.targets) || { daily: {}, monthly: {} };
+  const settings = (data && data.settings) || {};
+  const vendors = (data && data.vendors) || [];
+  const vendorMap = {};
+  for (const v of vendors) vendorMap[v.id] = v;
+
+  const latest = reports.length
+    ? reports.reduce((mx, r) => (r.date > mx ? r.date : mx), reports[0].date)
+    : todayStr();
+  const curYM = ymSel || ymOf(latest);
+
+  const monthReports = reports.filter((r) => ymOf(r.date) === curYM && hasSalesEntered(r));
+  const days = monthReports.length;
+
+  let salesEx = 0, salesInc = 0, guests = 0, partCount = 0, cashGenka = 0;
+  let takeoutEx = 0, eatinEx = 0;
+  for (const r of monthReports) {
+    salesEx += exSalesOf(r);
+    salesInc += Number(r.salesInc) || 0;
+    takeoutEx += (Number(r.tax8) || 0) / 0.08;
+    eatinEx += (Number(r.tax10) || 0) / 0.10;
+    guests += Number(r.guests) || 0;
+    partCount += Number(r.partCount) || 0;
+    for (const [vid, amt] of Object.entries(r.buys || {})) {
+      cashGenka += Number(amt) || 0;
+    }
+  }
+
+  // 前年同月（history、当月経過日数に揃える）
+  const prevYM = `${Number(curYM.slice(0, 4)) - 1}${curYM.slice(4)}`;
+  const maxDay = monthReports.reduce((mx, r) => {
+    const d = Number((r.date || "").slice(8, 10)); return d > mx ? d : mx;
+  }, 0);
+  let pyGuests = 0, pySalesInc = 0, pyDays = 0;
+  for (const h of history) {
+    if (ymOf(h.date) !== prevYM) continue;
+    const d = Number((h.date || "").slice(8, 10));
+    if (maxDay > 0 && d > maxDay) continue;
+    pyGuests += Number(h.guests) || 0;
+    pySalesInc += Number(h.sales) || 0;
+    pyDays++;
+  }
+  const hasPY = pyDays > 0;
+
+  const perInc = guests > 0 ? salesInc / guests : 0;
+  const genkaRateActual = salesEx > 0 ? cashGenka / salesEx : 0;
+  const bizDays = Number(settings.businessDays) || days || 1;
+  const partRate = Number(settings.partRate) || 0;
+  const partLabor = partCount * partRate;
+  const empLaborToDate = (Number(settings.fixedLabor) || 0) * (days / bizDays);
+  const laborRate = salesEx > 0 ? (empLaborToDate + partLabor) / salesEx : 0;
+
+  // 目標達成度（当月・税込基準）
+  let monthTarget = 0;
+  const mt = targets.monthly && targets.monthly[curYM];
+  if (mt != null && mt !== "") monthTarget = Number(mt) || 0;
+  else if (targets.daily) {
+    for (const [d, v] of Object.entries(targets.daily)) {
+      if (ymOf(d) === curYM) monthTarget += Number(v) || 0;
+    }
+  }
+  const achieveMonth = monthTarget > 0 ? salesInc / monthTarget : null;
+
+  return {
+    curYM, days,
+    salesInc, salesEx, guests, perInc,
+    takeoutEx, eatinEx,
+    takeoutRatio: (takeoutEx + eatinEx) > 0 ? takeoutEx / (takeoutEx + eatinEx) : null,
+    genkaRateActual, laborRate,
+    cashGenka, partCount,
+    monthTarget, achieveMonth,
+    hasPY,
+    pySalesInc: hasPY ? pySalesInc : null,
+    salesIncYoY: hasPY && pySalesInc > 0 ? salesInc / pySalesInc : null,
+    salesIncDeltaPY: hasPY ? salesInc - pySalesInc : null,
+    pyGuests: hasPY ? pyGuests : null,
+    guestsDeltaPY: hasPY ? guests - pyGuests : null,
+  };
+}
+
+// 店舗比較タブで選べる指標の定義（キー・ラベル・整形方法）
+const COMPARE_METRICS = [
+  { key: "salesInc", label: "税込売上", fmt: "yen" },
+  { key: "salesEx", label: "税抜売上", fmt: "yen" },
+  { key: "guests", label: "客数", fmt: "num" },
+  { key: "perInc", label: "税込客単価", fmt: "yen" },
+  { key: "takeoutRatio", label: "テイクアウト比率", fmt: "pct" },
+  { key: "salesIncYoY", label: "税込売上 前年比", fmt: "ratio" },
+  { key: "salesIncDeltaPY", label: "税込売上 前年差", fmt: "deltaYen" },
+  { key: "guestsDeltaPY", label: "客数 前年差", fmt: "deltaNum" },
+  { key: "genkaRateActual", label: "原価率", fmt: "pct" },
+  { key: "laborRate", label: "概算人件費率", fmt: "pct" },
+  { key: "achieveMonth", label: "月間目標達成度", fmt: "pct" },
+  { key: "days", label: "営業日数(売上入力)", fmt: "num" },
+];
+
 function App() {
   const [tab, setTab] = useState("dash");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -1259,12 +1378,16 @@ function App() {
     const days = monthReports.length;
 
     let salesEx = 0, salesInc = 0, guests = 0, partCount = 0, cashGenka = 0;
+    let takeoutEx = 0, eatinEx = 0; // テイクアウト(8%)/イートイン(10%) 税抜売上（税額から逆算）
     const genkaParts = { niku: 0, kome: 0, yasai: 0, chomi: 0, inryo: 0 };
     // ① 曜日別集計（税込売上・客数）。0=日 .. 6=土
     const dow = Array.from({ length: 7 }, () => ({ inc: 0, guests: 0, n: 0 }));
     for (const r of monthReports) {
       salesEx += exSalesOf(r);
       salesInc += Number(r.salesInc) || 0;
+      // テイクアウト(8%)・イートイン(10%) 税抜を内税額から逆算
+      takeoutEx += (Number(r.tax8) || 0) / 0.08;
+      eatinEx += (Number(r.tax10) || 0) / 0.10;
       guests += Number(r.guests) || 0;
       partCount += Number(r.partCount) || 0;
       for (const [vid, amt] of Object.entries(r.buys || {})) {
@@ -1368,6 +1491,9 @@ function App() {
       genkaParts,
       dowAvg, meatPeriodLabel,
       genkaRateActual, laborRate, laborToDate,
+      // テイクアウト(8%)/イートイン(10%) 税抜と比率
+      takeoutEx, eatinEx,
+      takeoutRatio: (takeoutEx + eatinEx) > 0 ? takeoutEx / (takeoutEx + eatinEx) : null,
       // 目標達成度
       monthTarget, achieveMonth, paceTarget, achievePace,
       latestDate, todayTarget, todaySalesInc, achieveToday,
@@ -1470,7 +1596,7 @@ function App() {
           )}
         </div>
         <nav className="km-nav">
-          {[["dash", "速報"], ["entry", "日報入力"], ["yoy", "前年比較"], ["goals", "目標設定"], ["recon", "月次突合"], ["log", "日報一覧"], ["vendor", "業者"], ["set", "設定"]].map(
+          {[["dash", "速報"], ["compare", "店舗比較"], ["entry", "日報入力"], ["yoy", "前年比較"], ["goals", "目標設定"], ["recon", "月次突合"], ["log", "日報一覧"], ["vendor", "業者"], ["set", "設定"]].map(
             ([k, label]) => (
               <button
                 key={k}
@@ -1486,6 +1612,7 @@ function App() {
 
       <main className="km-main">
         {tab === "dash" && <Dash calc={calc} settings={settings} reports={reports} dashYM={dashYM} setDashYM={setDashYM} />}
+        {tab === "compare" && <Compare settings={settings} setSettings={setSettings} storeList={storeList} storeId={storeId} />}
         {tab === "entry" && (
           <Entry form={form} setForm={setForm} addReport={addReport} settings={settings} vendors={vendors} reports={reports} />
         )}
@@ -1517,6 +1644,178 @@ function App() {
 }
 
 // ============================== 速報ダッシュボード ==============================
+// ===== 店舗比較タブ =====
+// 集約API(storeId=all)で全店データを取得し、当月/過去月の指標を横並び比較。
+// 取得データはIndexedDBにキャッシュし、オフライン時は前回分＋取得日時を表示。
+// 表示する指標は settings.compareMetrics（チェックボックス）で選択。
+function Compare({ settings, setSettings, storeList, storeId }) {
+  const [allData, setAllData] = React.useState(null);   // { storeId: {reports,history,...} }
+  const [fetchedAt, setFetchedAt] = React.useState(null);
+  const [loading, setLoading] = React.useState(false);
+  const [msg, setMsg] = React.useState("");
+  const [ymSel, setYmSel] = React.useState(""); // 空=全店共通の最新月を既定に
+
+  // 表示指標（未設定なら主要4指標を既定表示）
+  const visible = (settings.compareMetrics && settings.compareMetrics.length)
+    ? settings.compareMetrics
+    : ["salesInc", "salesEx", "guests", "takeoutRatio"];
+
+  // 起動時：キャッシュを読み、その後オンラインなら最新を取得
+  React.useEffect(() => {
+    (async () => {
+      try {
+        const cached = await KMStore.cacheGet("compareAll");
+        if (cached && cached.data) {
+          setAllData(cached.data);
+          setFetchedAt(cached.fetchedAt || null);
+        }
+      } catch (e) {}
+      if (KMStore.isCloud()) fetchAll(true);
+    })();
+    // eslint-disable-next-line
+  }, []);
+
+  async function fetchAll(silent) {
+    if (!KMStore.isCloud()) { setMsg("クラウド未設定のため比較できません（設定→クラウド連携）。"); return; }
+    setLoading(true); if (!silent) setMsg("");
+    const res = await KMStore.cloudLoadAll();
+    setLoading(false);
+    if (res.ok) {
+      const now = new Date().toISOString();
+      setAllData(res.data); setFetchedAt(now);
+      try { await KMStore.cacheSet("compareAll", { data: res.data, fetchedAt: now }); } catch (e) {}
+      setMsg("");
+    } else {
+      setMsg("最新データの取得に失敗しました（" + res.error + "）。" + (allData ? "前回取得分を表示しています。" : ""));
+    }
+  }
+
+  // 比較対象の店舗（storeList順。allDataに存在するものだけ）
+  const stores = (storeList || []).filter((s) => allData && allData[s.id]);
+
+  // 選択可能な月（全店のreportsを合わせた月の集合、新しい順）
+  const months = React.useMemo(() => {
+    const set = new Set();
+    if (allData) {
+      for (const sid of Object.keys(allData)) {
+        const d = allData[sid];
+        for (const r of ((d && d.reports) || [])) {
+          if (r.date && hasSalesEntered(r)) set.add(ymOf(r.date));
+        }
+      }
+    }
+    return Array.from(set).sort().reverse();
+  }, [allData]);
+  const latestYM = months[0] || "";
+  const curYM = ymSel || latestYM;
+
+  // 各店の指標を計算
+  const metricsByStore = React.useMemo(() => {
+    const out = {};
+    for (const s of stores) out[s.id] = computeStoreMetrics(allData[s.id], curYM);
+    return out;
+  }, [allData, stores.map((s) => s.id).join(","), curYM]);
+
+  function fmtVal(fmt, v) {
+    if (v == null || (typeof v === "number" && !isFinite(v))) return "—";
+    switch (fmt) {
+      case "yen": return yen(v);
+      case "num": return Number(v).toLocaleString();
+      case "pct": return pct(v);
+      case "ratio": return yoyTxt(v);
+      case "deltaYen": return deltaYen(v);
+      case "deltaNum": return deltaNum(v, "人");
+      default: return String(v);
+    }
+  }
+
+  function toggleMetric(key) {
+    const cur = new Set(visible);
+    if (cur.has(key)) cur.delete(key); else cur.add(key);
+    const next = COMPARE_METRICS.filter((m) => cur.has(m.key)).map((m) => m.key);
+    setSettings((s) => ({ ...s, compareMetrics: next.length ? next : ["salesInc"] }));
+  }
+
+  const fetchedLabel = fetchedAt
+    ? new Date(fetchedAt).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "—";
+
+  return (
+    <div className="km-page">
+      {/* 操作バー */}
+      <div className="km-row km-stats" style={{ alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 10 }}>
+        <span className="km-label" style={{ margin: 0 }}>比較する月</span>
+        <select className="km-select" value={curYM} onChange={(e) => setYmSel(e.target.value === latestYM ? "" : e.target.value)}>
+          {months.length === 0 && <option value="">—</option>}
+          {months.map((m) => (
+            <option key={m} value={m}>{m.replace("-", "年") + "月"}{m === latestYM ? "（最新）" : ""}</option>
+          ))}
+        </select>
+        <button className="km-btn" onClick={() => fetchAll(false)} disabled={loading}>
+          {loading ? "取得中…" : "最新に更新"}
+        </button>
+        <span className="km-note" style={{ margin: 0 }}>最終取得：{fetchedLabel}</span>
+      </div>
+
+      {msg && <div className="km-note" style={{ marginBottom: 12, color: "#b4413c" }}>{msg}</div>}
+
+      {(!allData || stores.length === 0) ? (
+        <Empty
+          title="比較できるデータがありません"
+          body={KMStore.isCloud()
+            ? "「最新に更新」で全店データを取得してください。各店で日報が保存されている必要があります。"
+            : "設定→クラウド連携でスプレッドシートを設定すると、全店の比較ができます。"}
+        />
+      ) : (
+        <>
+          {/* 比較表 */}
+          <div className="km-card">
+            <div className="km-cardhead">{curYM ? curYM.replace("-", "年") + "月" : ""} 当月累計 店舗比較</div>
+            <div className="km-tablewrap" style={{ marginTop: 10 }}>
+              <table className="km-table">
+                <thead>
+                  <tr>
+                    <th>指標</th>
+                    {stores.map((s) => <th key={s.id} className="r">{s.name}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {COMPARE_METRICS.filter((m) => visible.includes(m.key)).map((m) => (
+                    <tr key={m.key}>
+                      <td>{m.label}</td>
+                      {stores.map((s) => {
+                        const mv = metricsByStore[s.id] || {};
+                        const cls = (m.fmt === "deltaYen" || m.fmt === "deltaNum") ? deltaCls(mv[m.key]) : "";
+                        return <td key={s.id} className={"r mono " + cls}>{fmtVal(m.fmt, mv[m.key])}</td>;
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="km-note" style={{ marginTop: 10 }}>
+              ※ 各店とも「税込売上が入力済みの日報」を当月累計で集計。前年比は前年同月CSV（history）が取り込まれている店のみ表示。過去月は日報が無い日をCSVで補完します。
+            </div>
+          </div>
+
+          {/* 表示項目の選択 */}
+          <div className="km-card">
+            <div className="km-cardhead">表示する項目</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 18px", marginTop: 8 }}>
+              {COMPARE_METRICS.map((m) => (
+                <label key={m.key} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13, cursor: "pointer" }}>
+                  <input type="checkbox" checked={visible.includes(m.key)} onChange={() => toggleMetric(m.key)} />
+                  {m.label}
+                </label>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function Dash({ calc, settings, reports, dashYM, setDashYM }) {
   const c = calc;
   const std = STANDARD.rate;
@@ -1641,6 +1940,11 @@ function Dash({ calc, settings, reports, dashYM, setDashYM }) {
           cls={c.salesIncDeltaPY != null ? deltaCls(c.salesIncDeltaPY) : "dim"}
         />
         <Stat label="当月累計 税抜売上" value={yen(c.salesEx)} />
+        <Stat
+          label="テイクアウト比率"
+          value={c.takeoutRatio != null ? pct(c.takeoutRatio) : "—"}
+          sub={c.takeoutRatio != null ? `TO ${yen(c.takeoutEx)}／店内 ${yen(c.eatinEx)}（税抜）` : "税額8%/10%未入力"}
+        />
       </div>
 
       <div className="km-row km-stats">
