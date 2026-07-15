@@ -2793,6 +2793,15 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
       return { ...p, [ym]: { ...prevYM, _invoices: { ...prevInv, [String(vid)]: val } } };
     });
 
+  // ---- 業者別 突合済みチェック（月ごと・業者ごと）----
+  const checkedMap = cur._checked || {};
+  const setChecked = (vid, val) =>
+    setConfirms((p) => {
+      const prevYM = p[ym] || {};
+      const prevChk = prevYM._checked || {};
+      return { ...p, [ym]: { ...prevYM, _checked: { ...prevChk, [String(vid)]: !!val } } };
+    });
+
   // 原価業者（カテゴリが原価区分のもの）
   const genkaVendors = useMemo(
     () => vendors.filter((v) => ["niku", "kome", "yasai", "chomi", "inryo"].includes(v.cat)),
@@ -3088,6 +3097,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                   <th className="r">納品書合計（日報）</th>
                   <th className="r">請求額（月締め）</th>
                   <th className="r">差異</th>
+                  <th className="c">済</th>
                 </tr>
               </thead>
               <tbody>
@@ -3104,8 +3114,9 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                         const hasBill = billedRaw != null && billedRaw !== "";
                         const billed = hasBill ? (Number(billedRaw) || 0) : null;
                         const diff = billed != null ? billed - noted : null;
+                        const isChecked = !!checkedMap[id];
                         return (
-                          <tr key={id}>
+                          <tr key={id} className={isChecked ? "km-recon-done" : ""}>
                             <td>{v.name}</td>
                             <td>{catName[v.cat]}</td>
                             <td className="r mono dim">{per.first ? yen(per.first) : "—"}</td>
@@ -3123,6 +3134,14 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                             <td className={"r mono " + (diff == null ? "dim" : (Math.abs(diff) < 1 ? "pos" : (Math.abs(diff) / Math.max(noted, 1) > 0.1 ? "neg" : "")))}>
                               {diff != null ? (diff === 0 ? "0" : (diff > 0 ? "+" : "") + yen(diff)) : "—"}
                             </td>
+                            <td className="c">
+                              <input
+                                type="checkbox"
+                                checked={isChecked}
+                                title="この業者の突合を確認済みにする"
+                                onChange={(e) => setChecked(id, e.target.checked)}
+                              />
+                            </td>
                           </tr>
                         );
                       })}
@@ -3138,6 +3157,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                   const confSum = invGenka[cat] || 0;
                   const firstSum = vs.reduce((a, v) => a + ((vendorBuysByPeriod[String(v.id)] || {}).first || 0), 0);
                   const secondSum = vs.reduce((a, v) => a + ((vendorBuysByPeriod[String(v.id)] || {}).second || 0), 0);
+                  const chkDone = vs.filter((v) => checkedMap[String(v.id)]).length;
                   return (
                     <tr className="em" key={"f" + cat}>
                       <td colSpan={2}>{catName[cat]} 計 → 原価確定</td>
@@ -3146,6 +3166,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                       <td className="r mono">{yen(notedSum)}</td>
                       <td className="r mono">{yen(confSum)}</td>
                       <td className="r mono">{confSum - notedSum === 0 ? "0" : (confSum - notedSum > 0 ? "+" : "") + yen(confSum - notedSum)}</td>
+                      <td className="c mono dim">{chkDone}/{vs.length}</td>
                     </tr>
                   );
                 })}
@@ -3156,6 +3177,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
                   <td className="r mono">{yen(notedGrandTotal)}</td>
                   <td className="r mono">{yen(genkaGrandTotal)}</td>
                   <td className="r mono">{genkaGrandTotal - notedGrandTotal === 0 ? "0" : (genkaGrandTotal - notedGrandTotal > 0 ? "+" : "") + yen(genkaGrandTotal - notedGrandTotal)}</td>
+                  <td className="c mono">{genkaVendors.filter((v) => checkedMap[String(v.id)]).length}/{genkaVendors.length}</td>
                 </tr>
               </tfoot>
             </table>
@@ -3971,6 +3993,10 @@ const CSS = `
 .km-table td{padding:9px 8px;border-bottom:1px solid var(--line)}
 .km-table tr.em td{font-weight:700;background:var(--accent-soft)}
 .km-table .r{text-align:right}.mono{font-variant-numeric:tabular-nums}
+.km-table .c{text-align:center}
+.km-table tr.km-recon-done td{background:var(--accent-soft)}
+.km-table tr.km-recon-done td:first-child{position:relative}
+.km-table tr.km-recon-done td:first-child::before{content:"✓ ";color:var(--accent);font-weight:700}
 .km-select{border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:13px;background:#fff;color:var(--ink)}
 .km-numin{width:120px;border:1px solid var(--line);border-radius:7px;padding:6px 8px;font-size:13px;text-align:right;font-variant-numeric:tabular-nums}
 .km-numin:focus{outline:none;border-color:var(--accent)}
