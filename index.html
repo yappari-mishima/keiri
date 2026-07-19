@@ -654,7 +654,10 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
   }
 
   // xlsxのUint8Array → { ok, ym, items:[{cell,label,yen,src}], info:[...], raw:{...} }
-  window.parseCompanyPL = function (u8) {
+  // opts = { storeName, defaultCol }  複数店舗対応：
+  //   店名(storeName)が4行目に含まれる列を自動判定。無ければ defaultCol（既定AW）。
+  window.parseCompanyPL = function (u8, opts) {
+    opts = opts || {};
     try {
       var f = window.fflate;
       var zip = f.unzipSync(u8);
@@ -704,18 +707,45 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
         rows[ri][cidx] = val;
       }
 
-      // === LD課 収支表フォーマット：三島店は AW列固定・行は固定位置 ===
-      // 列インデックス（0始まり）: AW = 48
+      // === LD課 収支表フォーマット：店舗ごとに実績列を特定・行は固定位置 ===
+      // 三島=AW(48) が既定。複数店舗版では店名を4行目から探して列を自動判定する。
       function colToIdxLocal(col) {
         var n = 0;
         for (var i = 0; i < col.length; i++) n = n * 26 + (col.charCodeAt(i) - 64);
         return n - 1;
       }
-      var jisseki = colToIdxLocal('AW'); // 三島店の実績列（固定）
+      // 店名の正規化（空白・全半角・「やっぱりステーキ」接頭辞を除去して緩く比較）
+      function normName(s) {
+        if (typeof s !== 'string') return '';
+        return s.replace(/\s/g, '')
+          .replace(/やっぱりステーキ/g, '')
+          .replace(/ｲﾝﾀｰ/g, 'インター')
+          .toLowerCase();
+      }
+      var wantName = normName(opts.storeName || '');
+      var defaultColLetter = opts.defaultCol || 'AW';
+      var defaultCol = colToIdxLocal(defaultColLetter);
 
-      // AW4（結合セル）に店名が入っていれば三島であることを確認。無ければAW列既定で続行。
-      var hdrName = rows[3] ? rows[3][jisseki] : null; // 4行目 = index 3
-      var storeLabel = (typeof hdrName === 'string' && hdrName.replace(/\s/g, '')) ? hdrName : STORE;
+      // 4行目（index 3）を走査し、店名が一致/包含する列を探す
+      var jisseki = -1, matchedBy = '';
+      var hdrRow = rows[3] || [];
+      if (wantName) {
+        for (var ci = 0; ci < hdrRow.length; ci++) {
+          var cell = hdrRow[ci];
+          if (typeof cell === 'string' && cell) {
+            var nn = normName(cell);
+            if (nn && (nn === wantName || nn.indexOf(wantName) >= 0 || wantName.indexOf(nn) >= 0)) {
+              jisseki = ci; matchedBy = 'name'; break;
+            }
+          }
+        }
+      }
+      // 見つからなければ既定列にフォールバック
+      if (jisseki < 0) { jisseki = defaultCol; matchedBy = 'default'; }
+
+      // 実際の列の店名（プレビュー表示・確認用）
+      var hdrName = rows[3] ? rows[3][jisseki] : null;
+      var storeLabel = (typeof hdrName === 'string' && hdrName.replace(/\s/g, '')) ? hdrName : (opts.storeName || STORE);
 
       // 行位置（0始まり）で値(千円)を取得。毎月同じ位置である前提。
       function rowVal(rowNo1) { // rowNo1 = 1始まりの行番号
@@ -740,30 +770,32 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
       var shomo   = yenOf(21);  // r21 消耗品 → J37
       var sonotaKei = yenOf(28); // r28 その他経費計（AW28）→ J40算出に使用
 
+      // src表示は実際に読んだ列に合わせる（AW固定表記をやめる）
+      var CL = (function(){ var n=jisseki+1,s=''; while(n>0){ s=String.fromCharCode(65+(n-1)%26)+s; n=Math.floor((n-1)/26);} return s; })();
       var items = [
         // J16(売上高)は経理メイト速報から転記するため、会社PLからは取り込まない
-        { cell: 'J30', label: '人件費（社員）', yen: kyuyo, src: 'AW11 給与' },
-        { cell: 'J31', label: '人件費（パート）', yen: baito, src: 'AW13 アルバイト' },
-        { cell: 'J32', label: '法定福利', yen: fukuri, src: 'AW12 福利厚生' },
-        { cell: 'J33', label: '水道光熱費', yen: suikou, src: 'AW19 水光熱' },
-        { cell: 'J37', label: '消耗品費', yen: shomo, src: 'AW21 消耗品' },
-        { cell: 'J38', label: '広告宣伝費', yen: koukoku, src: 'AW16 広告' },
+        { cell: 'J30', label: '人件費（社員）', yen: kyuyo, src: CL + '11 給与' },
+        { cell: 'J31', label: '人件費（パート）', yen: baito, src: CL + '13 アルバイト' },
+        { cell: 'J32', label: '法定福利', yen: fukuri, src: CL + '12 福利厚生' },
+        { cell: 'J33', label: '水道光熱費', yen: suikou, src: CL + '19 水光熱' },
+        { cell: 'J37', label: '消耗品費', yen: shomo, src: CL + '21 消耗品' },
+        { cell: 'J38', label: '広告宣伝費', yen: koukoku, src: CL + '16 広告' },
       ].filter(function (it) { return it.yen != null; });
 
       // 施設費計・その他経費計は、家賃/ロイヤリティ確定後にJ35/J40を逆算するため raw で返す
       var raw = {
-        shisetsuKei: shisetsu,   // AW15 施設費計（円）
-        sonotaKei: sonotaKei,    // AW28 その他経費計（円）
+        shisetsuKei: shisetsu,   // (列)15 施設費計（円）
+        sonotaKei: sonotaKei,    // (列)28 その他経費計（円）
       };
 
       // 参考表示（FCに自動反映しない）
       var info = [
-        { label: '売上高(AW9)※参考', yen: uriage },
-        { label: '施設費計(AW15)', yen: shisetsu },
-        { label: 'その他経費計(AW28)', yen: sonotaKei },
-        { label: '本社費(AW33)', yen: yenOf(33) },
-        { label: '営業利益(AW35)', yen: yenOf(35) },
-        { label: '経常利益(AW37)', yen: yenOf(37) },
+        { label: '売上高(' + CL + '9)※参考', yen: uriage },
+        { label: '施設費計(' + CL + '15)', yen: shisetsu },
+        { label: 'その他経費計(' + CL + '28)', yen: sonotaKei },
+        { label: '本社費(' + CL + '33)', yen: yenOf(33) },
+        { label: '営業利益(' + CL + '35)', yen: yenOf(35) },
+        { label: '経常利益(' + CL + '37)', yen: yenOf(37) },
       ].filter(function (it) { return it.yen != null; });
 
       // 対象月（タイトル行 or シート名から推定）
@@ -778,7 +810,9 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
       var ymM = /(\d{4})\s*年\s*(\d{1,2})\s*月/.exec(scanText);
       if (ymM) ym = ymM[1] + '-' + ('0' + ymM[2]).slice(-2);
 
-      return { ok: true, ym: ym, store: storeLabel, items: items, info: info, raw: raw };
+      return { ok: true, ym: ym, store: storeLabel, items: items, info: info, raw: raw,
+               col: (function(){ var n=jisseki+1,s=''; while(n>0){ s=String.fromCharCode(65+(n-1)%26)+s; n=Math.floor((n-1)/26);} return s; })(),
+               matchedBy: matchedBy };
     } catch (e) {
       return { ok: false, error: (e && e.message) ? e.message : String(e) };
     }
@@ -2881,10 +2915,14 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
     reader.onload = () => {
       try {
         const u8 = new Uint8Array(reader.result);
-        const r = window.parseCompanyPL(u8);
+        // 複数店舗対応：現在の店舗名を渡し、PL内の該当列を自動判定。
+        // 既定列フォールバック：三島=AW、その他（静岡等）=AR。
+        var sn = (settings && settings.storeName) || "";
+        var defCol = /三島/.test(sn) ? "AW" : "AR";
+        const r = window.parseCompanyPL(u8, { storeName: sn, defaultCol: defCol });
         if (!r.ok) { setPlMsg("✗ 取込失敗: " + (r.error || "")); setPlPreview(null); return; }
         setPlPreview(r);
-        setPlMsg(`✓ 「${r.store}」を抽出しました（対象月 ${r.ym || "不明"}）。下の対応表を確認して反映してください。`);
+        setPlMsg(`✓ 「${r.store}」を抽出しました（${r.col}列・対象月 ${r.ym || "不明"}）${r.matchedBy === "default" ? "※店名一致せず既定列を使用" : ""}。下の対応表を確認して反映してください。`);
       } catch (err) {
         setPlMsg("✗ 取込失敗: " + (err && err.message ? err.message : String(err)));
         setPlPreview(null);
