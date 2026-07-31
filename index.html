@@ -362,9 +362,17 @@ const KMStore = (function () {
       return await loadLocal(storeId);
     },
     // 通常保存: ローカル即時 + クラウドへデバウンス送信（現在の店舗ぶん）
-    save(data) {
+    // expectStoreId: このデータが属する店舗ID。呼び出し側が必ず渡すこと。
+    //   店舗切替の途中（curStoreIdは新店舗だが画面データはまだ旧店舗）に
+    //   保存が走ると、旧店舗のデータを新店舗へ書き込んで破壊してしまう。
+    //   そのため不一致なら保存を破棄する（安全側に倒す）。
+    save(data, expectStoreId) {
       const sid = curStoreId;
       if (!sid) return;
+      if (expectStoreId && expectStoreId !== sid) {
+        console.warn("save skipped: store mismatch", { expectStoreId, curStoreId: sid });
+        return;
+      }
       saveLocalNow(sid, data);
       if (!isCloud()) return;
       pendingData = JSON.parse(JSON.stringify(data));
@@ -1260,12 +1268,22 @@ function App() {
   // ---- ブラウザ保存(IndexedDB) からの復元 / 自動保存 ----
   const [loaded, setLoaded] = React.useState(false);
   const skipFirstSave = React.useRef(true);
+  // 画面に今表示しているデータが「どの店舗のものか」。
+  // storeId(選択中の店舗)とは別に持つ。切替中は一時的に両者がズレるため、
+  // 保存時はこちらを使って店舗の取り違えを防ぐ。
+  const [dataStoreId, setDataStoreId] = React.useState(null);
+  // 読込の世代番号。切替が連続したとき、古い読込の結果を捨てるために使う。
+  const loadSeq = React.useRef(0);
 
   // 指定店舗のデータを読み込んで全stateに反映する共通処理
   async function loadStoreData(sid) {
+    const mySeq = ++loadSeq.current;
     setLoaded(false);
+    setDataStoreId(null);         // 読込中はどの店舗のデータでもない → 保存させない
     skipFirstSave.current = true; // 読込直後の保存を抑制
     const d = await KMStore.load(sid);
+    // 読込中に別の店舗へ切り替わっていたら、この結果は破棄する
+    if (mySeq !== loadSeq.current) return;
     setSettings(d && d.settings ? d.settings : { ...DEFAULT_SETTINGS, storeName: KMStores.nameOf(sid) });
     setVendors(d && d.vendors ? d.vendors : DEFAULT_VENDORS);
     setReports(d && d.reports ? d.reports : []);
@@ -1273,18 +1291,20 @@ function App() {
     setTargets(d && d.targets ? d.targets : { daily: {}, monthly: {}, yearly: {} });
     setConfirms(d && d.confirms ? d.confirms : {});
     setDashYM("");
+    setDataStoreId(sid);          // データと所属店舗を同時に確定させる
     setLoaded(true);
   }
 
-  React.useEffect(() => {
-    loadStoreData(storeId);
-    // eslint-disable-next-line
-  }, []);
-
-  // 起動時：クラウドの店舗リストを取得し、ローカルとマージ（クラウド優先）。
-  // これにより、別端末で追加した店舗が自動で反映される。
+  // 起動時の初期化。
+  // 【重要】データ読込と店舗リスト同期を「順番に」実行する。
+  // 以前は2つのuseEffectで同時に走らせており、両者が別々の店舗を読みに行くと
+  // 保存先を取り違えて他店のデータで上書きする事故が起きた。必ず直列にすること。
   React.useEffect(() => {
     (async () => {
+      // 1) まず現在の店舗のデータを読み込む
+      await loadStoreData(storeId);
+
+      // 2) 続いてクラウドの店舗リストを同期（別端末で追加した店舗を反映）
       if (!KMStore.isCloud()) return;
       try {
         const res = await KMStore.cloudLoadStores();
@@ -1296,7 +1316,7 @@ function App() {
             const first = merged[0].id;
             KMStores.setCurrent(first);
             setStoreId(first);
-            await loadStoreData(first);
+            await loadStoreData(first); // 1)は完了済みなので競合しない
           }
         } else if (res.ok && (!res.stores || !res.stores.length)) {
           // クラウド未登録なら、現在のローカルリストを初期投入（他端末用の土台）
@@ -1317,11 +1337,14 @@ function App() {
   }
   React.useEffect(() => {
     if (!loaded) return;
+    // データの所属店舗が未確定（読込中）なら保存しない。
+    // 選択中の店舗と一致しない場合も保存しない（切替途中の取り違え防止）。
+    if (!dataStoreId || dataStoreId !== storeId) return;
     // 初回（読込直後）のsaveは抑制：読み込んだデータをそのまま送り返して
     // 「未保存」表示や不要な再送が出るのを防ぐ。
     if (skipFirstSave.current) { skipFirstSave.current = false; return; }
-    KMStore.save({ settings, vendors, reports, history, targets, confirms });
-  }, [loaded, settings, vendors, reports, history, targets, confirms]);
+    KMStore.save({ settings, vendors, reports, history, targets, confirms }, dataStoreId);
+  }, [loaded, dataStoreId, storeId, settings, vendors, reports, history, targets, confirms]);
 
   // クラウド同期の状態をヘッダー表示用に購読
   React.useEffect(() => {
