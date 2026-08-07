@@ -674,6 +674,8 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
       if (zip['xl/sharedStrings.xml']) {
         var sx = f.strFromU8(zip['xl/sharedStrings.xml']);
         sst = (sx.match(/<si>[\s\S]*?<\/si>/g) || []).map(function (si) {
+          // ふりがな(<rPh>)は本文ではないので先に除去（店名に「ミシマテン」等が混ざるのを防ぐ）
+          si = si.replace(/<rPh[\s\S]*?<\/rPh>/g, '');
           // <t>...</t> を連結（<r>分割対応）
           var ts = si.match(/<t[^>]*>([\s\S]*?)<\/t>/g) || [];
           return ts.map(function (t) {
@@ -683,45 +685,52 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
           }).join('');
         });
       }
-      // 最初のworksheetを使う（このPLは1シート）
-      var wsPath = null;
-      for (var k in zip) { if (/^xl\/worksheets\/sheet\d+\.xml$/.test(k)) { wsPath = k; break; } }
-      if (!wsPath) return { ok: false, error: 'シートが見つかりません' };
-      var xml = f.strFromU8(zip[wsPath]);
+      // === 全シートを走査して「店名が書かれたブロック」を探す ===
+      // 会社側レイアウトは予告なく変わる（シート追加・行ずれ・列移動・店舗増減）ため、
+      // 位置を固定せず、毎回ファイルの中から店名と項目名を探し出す。
+      var wsPaths = [];
+      for (var k in zip) { if (/^xl\/worksheets\/sheet\d+\.xml$/.test(k)) wsPaths.push(k); }
+      wsPaths.sort(function (a, b) {
+        var na = Number((a.match(/sheet(\d+)\.xml$/) || [0, 0])[1]);
+        var nb = Number((b.match(/sheet(\d+)\.xml$/) || [0, 0])[1]);
+        return na - nb;
+      });
+      if (!wsPaths.length) return { ok: false, error: 'シートが見つかりません' };
 
-      // セルをパース → rows[rIndex0][cIndex0] = value
-      var rows = [];
-      // 各<c ...>を個別に走査（自己終了 <c .../> と通常 <c ...>...</c> の両対応）
-      var cellRe = /<c\s+r="([A-Z]+)(\d+)"([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
-      var m;
       function colToIdx(col) {
         var n = 0;
         for (var i = 0; i < col.length; i++) n = n * 26 + (col.charCodeAt(i) - 64);
         return n - 1;
       }
-      while ((m = cellRe.exec(xml))) {
-        var col = m[1], row = parseInt(m[2], 10), attr = m[3] || '', inner = m[4] || '';
-        var ri = row - 1, cidx = colToIdx(col);
-        var val = null;
-        var tMatch = /t="([^"]+)"/.exec(attr);
-        var typ = tMatch ? tMatch[1] : '';
-        var vM = /<v>([\s\S]*?)<\/v>/.exec(inner);
-        if (typ === 's' && vM) val = sst[parseInt(vM[1], 10)];
-        else if (typ === 'str' && vM) val = vM[1];
-        else if (typ === 'inlineStr') {
-          var isM = /<t[^>]*>([\s\S]*?)<\/t>/.exec(inner); val = isM ? isM[1] : '';
-        } else if (vM) val = Number(vM[1]);
-        if (!rows[ri]) rows[ri] = [];
-        rows[ri][cidx] = val;
+      function idxToCol(idx) {
+        var n = idx + 1, s = '';
+        while (n > 0) { s = String.fromCharCode(65 + (n - 1) % 26) + s; n = Math.floor((n - 1) / 26); }
+        return s;
       }
 
-      // === LD課 収支表フォーマット：店舗ごとに実績列を特定・行は固定位置 ===
-      // 三島=AW(48) が既定。複数店舗版では店名を4行目から探して列を自動判定する。
-      function colToIdxLocal(col) {
-        var n = 0;
-        for (var i = 0; i < col.length; i++) n = n * 26 + (col.charCodeAt(i) - 64);
-        return n - 1;
+      // 1シート分のXML → rows[r][c]
+      function parseSheet(xmlStr) {
+        var rws = [];
+        var cellRe = /<c\s+r="([A-Z]+)(\d+)"([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
+        var m;
+        while ((m = cellRe.exec(xmlStr))) {
+          var col = m[1], row = parseInt(m[2], 10), attr = m[3] || '', inner = m[4] || '';
+          var ri = row - 1, cidx = colToIdx(col);
+          var val = null;
+          var tMatch = /t="([^"]+)"/.exec(attr);
+          var typ = tMatch ? tMatch[1] : '';
+          var vM = /<v>([\s\S]*?)<\/v>/.exec(inner);
+          if (typ === 's' && vM) val = sst[parseInt(vM[1], 10)];
+          else if (typ === 'str' && vM) val = vM[1];
+          else if (typ === 'inlineStr') {
+            var isM = /<t[^>]*>([\s\S]*?)<\/t>/.exec(inner); val = isM ? isM[1] : '';
+          } else if (vM) val = Number(vM[1]);
+          if (!rws[ri]) rws[ri] = [];
+          rws[ri][cidx] = val;
+        }
+        return rws;
       }
+
       // 店名の正規化（空白・全半角・「やっぱりステーキ」接頭辞を除去して緩く比較）
       function normName(s) {
         if (typeof s !== 'string') return '';
@@ -731,95 +740,163 @@ window.PL_TEMPLATE_B64 = "UEsDBBQABgAIAAAAIQB57bya0QEAALYLAAATAAgCW0NvbnRlbnRfVH
           .toLowerCase();
       }
       var wantName = normName(opts.storeName || '');
-      var defaultColLetter = opts.defaultCol || 'AW';
-      var defaultCol = colToIdxLocal(defaultColLetter);
 
-      // 4行目（index 3）を走査し、店名が一致/包含する列を探す
-      var jisseki = -1, matchedBy = '';
-      var hdrRow = rows[3] || [];
-      if (wantName) {
-        for (var ci = 0; ci < hdrRow.length; ci++) {
-          var cell = hdrRow[ci];
-          if (typeof cell === 'string' && cell) {
+      // 見出し行の判定：その次の行に「実績」があれば店名見出し行とみなす
+      function isHeaderRow(rws, r) {
+        var nx = rws[r + 1];
+        if (!nx) return false;
+        for (var c = 0; c < nx.length; c++) {
+          if (typeof nx[c] === 'string' && norm(nx[c]) === '実績') return true;
+        }
+        return false;
+      }
+
+      var sheets = [];
+      for (var si = 0; si < wsPaths.length; si++) {
+        sheets.push({ path: wsPaths[si], rows: parseSheet(f.strFromU8(zip[wsPaths[si]])) });
+      }
+
+      // 各シートの見出し行を洗い出し、店名が載っているブロックを候補にする
+      var candidates = [];
+      for (var si2 = 0; si2 < sheets.length; si2++) {
+        var rows2 = sheets[si2].rows;
+        var heads = [];
+        for (var r2 = 0; r2 < rows2.length; r2++) { if (rows2[r2] && isHeaderRow(rows2, r2)) heads.push(r2); }
+        for (var hi = 0; hi < heads.length; hi++) {
+          var hr = heads[hi];
+          var endR = (hi + 1 < heads.length) ? heads[hi + 1] - 1 : rows2.length - 1;
+          var hrow = rows2[hr] || [];
+          for (var c2 = 0; c2 < hrow.length; c2++) {
+            var cell = hrow[c2];
+            if (typeof cell !== 'string' || !cell || !wantName) continue;
+            // 【重要】見出し行には「前年実績」列にも店名が残っていることがある。
+            // 直下が「実績」の列だけを採用しないと、前年の数字を取り込んでしまう。
+            var sub = (rows2[hr + 1] || [])[c2];
+            if (typeof sub !== 'string' || norm(sub) !== '実績') continue;
             var nn = normName(cell);
-            if (nn && (nn === wantName || nn.indexOf(wantName) >= 0 || wantName.indexOf(nn) >= 0)) {
-              jisseki = ci; matchedBy = 'name'; break;
+            if (!nn) continue;
+            if (nn === wantName || nn.indexOf(wantName) >= 0 || wantName.indexOf(nn) >= 0) {
+              candidates.push({ sheetIdx: si2, rows: rows2, headRow: hr, endRow: endR, col: c2, name: cell });
             }
           }
         }
       }
-      // 見つからなければ既定列にフォールバック
-      if (jisseki < 0) { jisseki = defaultCol; matchedBy = 'default'; }
 
-      // 実際の列の店名（プレビュー表示・確認用）
-      var hdrName = rows[3] ? rows[3][jisseki] : null;
+      // 店名が1つも見つからない場合は、従来どおり1枚目・4行目・既定列にフォールバック
+      var usedDefault = false;
+      if (!candidates.length) {
+        var rowsF = sheets[0].rows;
+        candidates.push({
+          sheetIdx: 0, rows: rowsF, headRow: 3, endRow: rowsF.length - 1,
+          col: colToIdx(opts.defaultCol || 'AW'), name: opts.storeName || STORE
+        });
+        usedDefault = true;
+      }
+
+      // ブロック内でラベルを探し、値(円)と実際の行番号を返す
+      function lookupIn(cand, label) {
+        var target = norm(label);
+        for (var r = cand.headRow; r <= cand.endRow; r++) {
+          var rr = cand.rows[r];
+          if (!rr) continue;
+          var a = norm(rr[0]), b = norm(rr[1]);
+          if ((a && a.indexOf(target) === 0) || (b && b.indexOf(target) === 0)) {
+            return { yen: Math.round(numOf(rr[cand.col]) * 1000), row: r + 1 };
+          }
+        }
+        return null;
+      }
+
+      // 経費が入っているブロックを選ぶ（同じ店名が複数ブロックにある場合の判定）
+      var KEYS = ['給与', '福利厚生', 'アルバイト', '施設費計', 'その他経費計'];
+      var best = null;
+      for (var ci2 = 0; ci2 < candidates.length; ci2++) {
+        var cd = candidates[ci2], score = 0;
+        for (var ki = 0; ki < KEYS.length; ki++) {
+          var got = lookupIn(cd, KEYS[ki]);
+          if (got && got.yen) score++;
+        }
+        cd.score = score;
+        if (!best || score > best.score) best = cd;
+      }
+
+      // 【重要・安全装置】経費が入っているブロックが1つも無ければ取込を中止する。
+      // 空欄を0円として取り込むと、人件費などが0で上書きされる事故になるため。
+      if (!best || best.score === 0) {
+        return {
+          ok: false,
+          empty: true,
+          error: '「' + (opts.storeName || STORE) + '」の経費が、このファイルのどのシートにも入力されていません'
+               + '（人件費・施設費・その他経費がすべて空欄）。売上だけの速報版の可能性があります。'
+               + '取込を中止しました。本部に確定版をご確認ください。'
+        };
+      }
+
+      var jisseki = best.col;
+      var CL = idxToCol(jisseki);
+      var rows = best.rows;
+      var matchedBy = usedDefault ? 'default' : 'name';
+      var hdrName = rows[best.headRow] ? rows[best.headRow][jisseki] : null;
       var storeLabel = (typeof hdrName === 'string' && hdrName.replace(/\s/g, '')) ? hdrName : (opts.storeName || STORE);
 
-      // 行位置（0始まり）で値(千円)を取得。毎月同じ位置である前提。
-      function rowVal(rowNo1) { // rowNo1 = 1始まりの行番号
-        var rr = rows[rowNo1 - 1];
-        return rr ? numOf(rr[jisseki]) : 0;
-      }
-      function yenOf(rowNo1) { // 千円 → 円
-        return Math.round(rowVal(rowNo1) * 1000);
-      }
+      function pick(label) { return lookupIn(best, label); }
 
-      // --- 会社PL 固定行マップ（LD課フォーマット・千円） ---
-      // r11 給与 / r12 福利厚生 / r13 アルバイト
-      // r15 施設費計 / r16 広告 / r19 水光熱 / r21 消耗品
-      // r28 その他経費計 = SUM(AW16:AW27)（広告・水光熱・消耗品・通信・保険・車両・雑費等を含む）
-      var uriage  = yenOf(9);   // r9 総売上高（想定行）
-      var kyuyo   = yenOf(11);  // r11 給与 → J30 社員
-      var fukuri  = yenOf(12);  // r12 福利厚生 → J32 法定福利
-      var baito   = yenOf(13);  // r13 アルバイト → J31 パート
-      var shisetsu = yenOf(15); // r15 施設費計（AW15）→ J35算出に使用
-      var koukoku = yenOf(16);  // r16 広告 → J38
-      var suikou  = yenOf(19);  // r19 水光熱 → J33
-      var shomo   = yenOf(21);  // r21 消耗品 → J37
-      var sonotaKei = yenOf(28); // r28 その他経費計（AW28）→ J40算出に使用
+      var g_kyuyo    = pick('給与');
+      var g_fukuri   = pick('福利厚生');
+      var g_baito    = pick('アルバイト');
+      var g_shisetsu = pick('施設費計');
+      var g_koukoku  = pick('広告宣伝');
+      var g_suikou   = pick('水道光熱');
+      var g_shomo    = pick('消耗品');
+      var g_sonota   = pick('その他経費計');
+      var g_uriage   = pick('総売上高');
+      var g_honsha   = pick('本社費');
+      var g_eigyo    = pick('営業利益');
+      var g_keijo    = pick('経常利益');
 
-      // src表示は実際に読んだ列に合わせる（AW固定表記をやめる）
-      var CL = (function(){ var n=jisseki+1,s=''; while(n>0){ s=String.fromCharCode(65+(n-1)%26)+s; n=Math.floor((n-1)/26);} return s; })();
       var items = [
-        // J16(売上高)は経理メイト速報から転記するため、会社PLからは取り込まない
-        { cell: 'J30', label: '人件費（社員）', yen: kyuyo, src: CL + '11 給与' },
-        { cell: 'J31', label: '人件費（パート）', yen: baito, src: CL + '13 アルバイト' },
-        { cell: 'J32', label: '法定福利', yen: fukuri, src: CL + '12 福利厚生' },
-        { cell: 'J33', label: '水道光熱費', yen: suikou, src: CL + '19 水光熱' },
-        { cell: 'J37', label: '消耗品費', yen: shomo, src: CL + '21 消耗品' },
-        { cell: 'J38', label: '広告宣伝費', yen: koukoku, src: CL + '16 広告' },
-      ].filter(function (it) { return it.yen != null; });
+        { cell: 'J30', label: '人件費（社員）',   g: g_kyuyo,   ln: '給与' },
+        { cell: 'J31', label: '人件費（パート）', g: g_baito,   ln: 'アルバイト' },
+        { cell: 'J32', label: '法定福利',        g: g_fukuri,  ln: '福利厚生' },
+        { cell: 'J33', label: '水道光熱費',      g: g_suikou,  ln: '水道光熱費' },
+        { cell: 'J37', label: '消耗品費',        g: g_shomo,   ln: '消耗品費' },
+        { cell: 'J38', label: '広告宣伝費',      g: g_koukoku, ln: '広告宣伝費' },
+      ].filter(function (it) { return it.g != null; })
+       .map(function (it) { return { cell: it.cell, label: it.label, yen: it.g.yen, src: CL + it.g.row + ' ' + it.ln }; });
 
       // 施設費計・その他経費計は、家賃/ロイヤリティ確定後にJ35/J40を逆算するため raw で返す
       var raw = {
-        shisetsuKei: shisetsu,   // (列)15 施設費計（円）
-        sonotaKei: sonotaKei,    // (列)28 その他経費計（円）
+        shisetsuKei: g_shisetsu ? g_shisetsu.yen : null,
+        sonotaKei:   g_sonota   ? g_sonota.yen   : null,
       };
 
       // 参考表示（FCに自動反映しない）
+      function ref(label, g) {
+        return { label: label + (g ? '(' + CL + g.row + ')' : '') + '', yen: g ? g.yen : null };
+      }
       var info = [
-        { label: '売上高(' + CL + '9)※参考', yen: uriage },
-        { label: '施設費計(' + CL + '15)', yen: shisetsu },
-        { label: 'その他経費計(' + CL + '28)', yen: sonotaKei },
-        { label: '本社費(' + CL + '33)', yen: yenOf(33) },
-        { label: '営業利益(' + CL + '35)', yen: yenOf(35) },
-        { label: '経常利益(' + CL + '37)', yen: yenOf(37) },
+        ref('売上高', g_uriage),
+        ref('施設費計', g_shisetsu),
+        ref('その他経費計', g_sonota),
+        ref('本社費', g_honsha),
+        ref('営業利益', g_eigyo),
+        ref('経常利益', g_keijo),
       ].filter(function (it) { return it.yen != null; });
 
-      // 対象月（タイトル行 or シート名から推定）
+      // 対象月（タイトル行から推定）
       var ym = '';
       var scanText = '';
-      for (var rr = 0; rr < Math.min(rows.length, 6); rr++) {
-        if (!rows[rr]) continue;
-        for (var cc2 = 0; cc2 < Math.min(rows[rr].length, 6); cc2++) {
-          if (typeof rows[rr][cc2] === 'string') scanText += rows[rr][cc2] + ' ';
+      for (var rr2 = 0; rr2 < Math.min(rows.length, 6); rr2++) {
+        if (!rows[rr2]) continue;
+        for (var cc2 = 0; cc2 < Math.min(rows[rr2].length, 6); cc2++) {
+          if (typeof rows[rr2][cc2] === 'string') scanText += rows[rr2][cc2] + ' ';
         }
       }
       var ymM = /(\d{4})\s*年\s*(\d{1,2})\s*月/.exec(scanText);
       if (ymM) ym = ymM[1] + '-' + ('0' + ymM[2]).slice(-2);
 
       return { ok: true, ym: ym, store: storeLabel, items: items, info: info, raw: raw,
-               col: (function(){ var n=jisseki+1,s=''; while(n>0){ s=String.fromCharCode(65+(n-1)%26)+s; n=Math.floor((n-1)/26);} return s; })(),
+               col: CL, sheetNo: best.sheetIdx + 1, headRow: best.headRow + 1,
                matchedBy: matchedBy };
     } catch (e) {
       return { ok: false, error: (e && e.message) ? e.message : String(e) };
@@ -2979,9 +3056,12 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
         var sn = (settings && settings.storeName) || "";
         var defCol = /三島/.test(sn) ? "AW" : "AR";
         const r = window.parseCompanyPL(u8, { storeName: sn, defaultCol: defCol });
-        if (!r.ok) { setPlMsg("✗ 取込失敗: " + (r.error || "")); setPlPreview(null); return; }
+        if (!r.ok) {
+          setPlMsg((r.empty ? "⚠ 取込を中止しました: " : "✗ 取込失敗: ") + (r.error || ""));
+          setPlPreview(null); return;
+        }
         setPlPreview(r);
-        setPlMsg(`✓ 「${r.store}」を抽出しました（${r.col}列・対象月 ${r.ym || "不明"}）${r.matchedBy === "default" ? "※店名一致せず既定列を使用" : ""}。下の対応表を確認して反映してください。`);
+        setPlMsg(`✓ 「${r.store}」を抽出しました（シート${r.sheetNo} / ${r.col}列 ${r.headRow}行 / 対象月 ${r.ym || "不明"}）${r.matchedBy === "default" ? "※店名が見つからず既定列を使用" : ""}。下の対応表を確認して反映してください。`);
       } catch (err) {
         setPlMsg("✗ 取込失敗: " + (err && err.message ? err.message : String(err)));
         setPlPreview(null);
@@ -3128,7 +3208,7 @@ function Reconcile({ calc, settings, reports, vendors, vendorMap, confirms, setC
       <div className="km-card">
         <div className="km-cardhead">会社PL（LD課収支表）から取込</div>
         <div className="km-note" style={{ marginTop: 0 }}>
-          会社配布のLD課収支表（Excel）を読み込むと、三島店の列（AW列・実績）から売上・人件費・福利・水光熱・消耗品・広告を抽出します。あわせて施設費計(AW15)・その他経費計(AW28)を取得し、反映時に <b>J35 減価償却費 = 施設費計 − 家賃</b>、<b>J40 その他 = その他経費計 −（水光熱+ロイヤリティ+消耗品+広告+衛生費）</b> を自動計算します。ロイヤリティ(J36)はDS請求書の税抜確定値、家賃(J34)は設定値を使用。概算消費税(J41)は取込時0（手入力で上書き可）。原価・棚卸・借入は対象外（日報／設定／手入力）です。
+          会社配布のLD課収支表（Excel）を読み込むと、ファイル内の全シートから現在の店舗名を探し、その「実績」列を自動判定して人件費・福利・水光熱・消耗品・広告を抽出します（行位置・列位置・シートが変わっても追従します）。あわせて施設費計・その他経費計を取得し、反映時に <b>J35 減価償却費 = 施設費計 − 家賃</b>、<b>J40 その他 = その他経費計 −（水光熱+ロイヤリティ+消耗品+広告+衛生費）</b> を自動計算します。経費欄が空のファイル（売上だけの速報版）は、0円で上書きしてしまう事故を防ぐため取込を中止します。ロイヤリティ(J36)はDS請求書の税抜確定値、家賃(J34)は設定値を使用。概算消費税(J41)は取込時0（手入力で上書き可）。原価・棚卸・借入は対象外（日報／設定／手入力）です。
         </div>
         <div className="km-row km-stats" style={{ marginTop: 12 }}>
           <label className="km-btn" style={{ cursor: "pointer", margin: 0 }}>
